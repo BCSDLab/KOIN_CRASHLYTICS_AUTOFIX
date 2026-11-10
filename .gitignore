@@ -1,0 +1,8 @@
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.env*
+*.local
+firebase-debug.log*
+gha-creds-*.json

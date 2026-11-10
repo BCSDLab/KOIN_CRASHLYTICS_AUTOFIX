@@ -1,0 +1,8 @@
+{
+  "functions": [{
+    "source": ".",
+    "codebase": "crashlytics-issues",
+    "runtime": "python313",
+    "ignore": [".venv", "venv", "__pycache__", "*.pyc", ".git", ".github", ".env*", "gha-creds-*.json", "README.md", "firebase-debug.log", "*.local"]
+  }]
+}

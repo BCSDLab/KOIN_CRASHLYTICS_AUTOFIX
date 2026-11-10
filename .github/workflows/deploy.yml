@@ -1,0 +1,74 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy Firebase Functions
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install runtime dependencies
+        run: |
+          python -m venv venv
+          venv/bin/pip install --disable-pip-version-check --require-hashes -r requirements.txt
+
+      - name: Write runtime configuration
+        env:
+          CRASHLYTICS_ENV: ${{ secrets.CRASHLYTICS_ENV }}
+        run: |
+          venv/bin/python - <<'PY'
+          import os
+          from pathlib import Path
+          config = os.environ["CRASHLYTICS_ENV"]
+          settings = dict(
+              line.split("=", 1) for line in config.splitlines()
+              if line.strip() and not line.lstrip().startswith("#")
+          )
+          project = settings["CRASHLYTICS_PROJECT_ID"].strip()
+          Path(f".env.{project}").write_text(config, encoding="utf-8")
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as output:
+              output.write(f"GOOGLE_CLOUD_PROJECT={project}\n")
+              output.write(f"GOOGLE_CLOUD_QUOTA_PROJECT={project}\n")
+          PY
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          credentials_json: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+          project_id: ${{ env.GOOGLE_CLOUD_PROJECT }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Register runtime secrets and deploy
+        env:
+          GITHUB_APP_PRIVATE_KEY: ${{ secrets.CRASHLYTICS_GITHUB_APP_PRIVATE_KEY }}
+          OPENAI_API_KEY: ${{ secrets.CRASHLYTICS_OPENAI_API_KEY }}
+        run: |
+          printf '%s' "$GITHUB_APP_PRIVATE_KEY" | npx --yes firebase-tools@15.35.0 functions:secrets:set CRASHLYTICS_GITHUB_APP_PRIVATE_KEY --data-file - --project "$GOOGLE_CLOUD_PROJECT" --non-interactive
+          printf '%s' "$OPENAI_API_KEY" | npx --yes firebase-tools@15.35.0 functions:secrets:set CRASHLYTICS_OPENAI_API_KEY --data-file - --project "$GOOGLE_CLOUD_PROJECT" --non-interactive
+          npx --yes firebase-tools@15.35.0 deploy --only functions:crashlytics-issues --project "$GOOGLE_CLOUD_PROJECT" --non-interactive
