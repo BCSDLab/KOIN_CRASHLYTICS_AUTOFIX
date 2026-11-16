@@ -1,0 +1,101 @@
+name: Crashlytics operations
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Read state, repair private worker invocation, or run one existing task
+        type: choice
+        options: [inspect, repair, retry, logs]
+        default: inspect
+        required: true
+      task_id:
+        description: Existing generateCrashlyticsFix task ID; required only for retry
+        type: string
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: crashlytics-operations
+  cancel-in-progress: false
+
+jobs:
+  operate:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CLOUDSDK_CORE_PROJECT: kap-chat
+      CLOUDSDK_CORE_DISABLE_PROMPTS: "1"
+      REGION: us-central1
+      RUNTIME_ACCOUNT: crashlytics-autofix@kap-chat.iam.gserviceaccount.com
+      OPERATION: ${{ inputs.operation }}
+      TASK_ID: ${{ inputs.task_id }}
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          credentials_json: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+          project_id: kap-chat
+
+      - name: Set up Google Cloud CLI
+        uses: google-github-actions/setup-gcloud@v3
+
+      - name: Inspect worker invocation and queued tasks
+        if: inputs.operation == 'inspect'
+        shell: bash
+        run: |
+          set -euo pipefail
+          for function in generateCrashlyticsFix mergeCrashlyticsFix; do
+            gcloud functions describe "$function" --gen2 --region "$REGION" \
+              --format='json(serviceConfig.serviceAccountEmail,serviceConfig.uri)'
+            gcloud tasks list --queue "$function" --location "$REGION" \
+              --format='json(name,httpRequest.url,httpRequest.oidcToken,dispatchCount,responseCount,lastAttempt,scheduleTime)'
+          done
+          for service in generatecrashlyticsfix mergecrashlyticsfix; do
+            gcloud run services get-iam-policy "$service" --region "$REGION" --format=json
+          done
+          gcloud projects get-iam-policy kap-chat \
+            --flatten='bindings[].members' \
+            --filter='bindings.role=roles/cloudtasks.serviceAgent' \
+            --format='table(bindings.role,bindings.members)'
+
+      - name: Grant private worker invocation to the runtime account
+        if: inputs.operation == 'repair'
+        shell: bash
+        run: |
+          set -euo pipefail
+          for service in generatecrashlyticsfix mergecrashlyticsfix; do
+            gcloud run services add-iam-policy-binding "$service" --region "$REGION" \
+              --member="serviceAccount:$RUNTIME_ACCOUNT" --role=roles/run.invoker \
+              --format=json
+          done
+
+      - name: Run exactly one existing generation task
+        if: inputs.operation == 'retry'
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$TASK_ID" =~ ^[a-f0-9]{64}$ ]] || { echo 'Expected an existing SHA-256 task ID'; exit 1; }
+          account=$(gcloud tasks describe "$TASK_ID" --queue generateCrashlyticsFix \
+            --location "$REGION" --format='value(httpRequest.oidcToken.serviceAccountEmail)')
+          url=$(gcloud tasks describe "$TASK_ID" --queue generateCrashlyticsFix \
+            --location "$REGION" --format='value(httpRequest.url)')
+          [[ "$account" == "$RUNTIME_ACCOUNT" ]]
+          [[ "$url" == 'https://us-central1-kap-chat.cloudfunctions.net/generateCrashlyticsFix' ]]
+          gcloud tasks run "$TASK_ID" --queue generateCrashlyticsFix --location "$REGION" \
+            --format='json(name,dispatchCount,responseCount,lastAttempt,scheduleTime)'
+
+      - name: Read recent worker logs without querying BigQuery
+        if: inputs.operation == 'logs'
+        shell: bash
+        run: |
+          set -euo pipefail
+          gcloud logging read \
+            'resource.type="cloud_run_revision" AND resource.labels.location="us-central1" AND (resource.labels.service_name="generatecrashlyticsfix" OR resource.labels.service_name="mergecrashlyticsfix")' \
+            --freshness=30m --limit=80 --order=asc \
+            --format='json(timestamp,severity,textPayload,jsonPayload,httpRequest,trace,resource.labels.service_name)'
+          gcloud tasks list --queue generateCrashlyticsFix --location "$REGION" \
+            --format='json(name,dispatchCount,responseCount,lastAttempt,scheduleTime)'
