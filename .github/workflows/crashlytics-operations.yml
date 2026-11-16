@@ -69,6 +69,11 @@ jobs:
             fi
           done
 
+      - name: Allow newly added queue IAM bindings to propagate before querying or running a task
+        if: steps.task_access.outputs.added_roles != ''
+        shell: bash
+        run: sleep 180
+
       - name: Inspect worker invocation and queued tasks
         if: inputs.operation == 'inspect'
         shell: bash
