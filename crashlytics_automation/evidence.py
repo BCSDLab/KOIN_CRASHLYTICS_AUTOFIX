@@ -1,33 +1,10 @@
-"""Crashlytics export lookup for the crashed release.
+"""Crashlytics export lookup for matching crash evidence.
 
-Uses the real ``google-cloud-bigquery`` client API: ``get_table`` for export-table
-discovery and a parameterised ``query`` whose job result is consumed directly.
-Only the smallest amount of source evidence is returned; exporter rows can hold
-logs and user payloads and those are never propagated.
-
-``find_evidence`` returns:
-
-* ``None`` while the export tables/data are still pending (retry later),
-* ``{"status": "unavailable", "reason": ...}`` when the crash cannot be
-  attributed to Kotlin source,
-* ``{"status": "ready", "displayVersion", "buildVersion", "frame", "eventTime",
-  "breadcrumbs", "environment"}`` when a developer frame from the matching
-  release is proven,
-* ``{"status": "unavailable", "reason", "displayVersion", "buildVersion",
-  "eventTime", "breadcrumbs", "environment"}`` when the event matches the alert
-  but no developer frame can be proven, so the manual handoff keeps its context.
-
-``environment`` is projected from the five safe
-``device.{manufacturer,model,architecture}`` and
-``operating_system.{name,display_version}`` columns. Values that are missing,
-blank, non-textual, or not a short plain device/OS token are omitted instead of
-guessed; identifiers, locale, user data and logs are never selected.
-
-Breadcrumbs are the last ten Analytics events at or before the crash, reduced to
-``{"name", "timestamp", "params"}``. Only developer-controlled categorical
-parameters (``screen_name``, ``screen_class``, and the ``input_kind`` enum) are
-kept; logs, user fields, arbitrary parameters, and raw input are never returned.
+Matching events are ready even when no app source frame is available. The
+optional ``frame`` is only a source-location hint; ``stackTrace`` retains
+bounded, privacy-sanitized exception and thread context for investigation.
 """
+
 
 from __future__ import annotations
 
@@ -37,6 +14,11 @@ from typing import Any, Mapping
 
 from google.api_core.exceptions import NotFound
 from google.cloud import bigquery as bq
+from .privacy import safe_text
+
+_MAX_STACK_GROUPS = 12
+_MAX_STACK_FRAMES = 100
+_MAX_STACK_TEXT = 512
 
 _DAY = timedelta(days=1)
 _WINDOW_BEFORE = 30 * _DAY
@@ -116,17 +98,33 @@ def _select_columns(table: str) -> str:
     application.display_version AS displayVersion,
     application.build_version AS buildVersion,
     event_timestamp AS eventTime,
+    error_type AS errorType,
     STRUCT(blame_frame.file AS file, blame_frame.line AS line,
-      blame_frame.symbol AS symbol, blame_frame.owner AS owner) AS blameFrame,
-    ARRAY(SELECT AS STRUCT f.file, f.line, f.symbol, f.owner
-      FROM UNNEST(exceptions) AS ex WITH OFFSET ex_index,
-        UNNEST(ex.frames) AS f WITH OFFSET frame_index
-      ORDER BY ex.blamed DESC, ex_index DESC, frame_index LIMIT 100) AS exceptionFrames,
-    ARRAY(SELECT AS STRUCT f.file, f.line, f.symbol, f.owner
-      FROM UNNEST(threads) AS thread WITH OFFSET thread_index,
-        UNNEST(thread.frames) AS f WITH OFFSET frame_index
-      WHERE thread.crashed OR thread.blamed
-      ORDER BY thread.blamed DESC, thread_index, frame_index LIMIT 100) AS threadFrames,
+      blame_frame.symbol AS symbol, blame_frame.owner AS owner,
+      blame_frame.library AS library, blame_frame.offset AS offset,
+      blame_frame.address AS address, blame_frame.blamed AS blamed) AS blameFrame,
+    ARRAY_LENGTH(exceptions) AS exceptionCount,
+    ARRAY_LENGTH(threads) AS threadCount,
+    ARRAY(SELECT AS STRUCT ex.type AS type, ex.title AS title, ex.subtitle AS subtitle,
+        ex.exception_message AS message, ex.nested AS nested,
+        ex.blamed AS blamed, ARRAY_LENGTH(ex.frames) AS frameCount,
+        ARRAY(SELECT AS STRUCT f.file AS file, f.line AS line, f.symbol AS symbol,
+            f.owner AS owner, f.library AS library, f.offset AS offset, f.address AS address,
+            f.blamed AS blamed
+          FROM UNNEST(ex.frames) AS f WITH OFFSET frame_index
+          ORDER BY frame_index LIMIT 100) AS frames
+      FROM UNNEST(exceptions) AS ex WITH OFFSET ex_index
+      ORDER BY ex_index LIMIT {_MAX_STACK_GROUPS}) AS exceptions,
+    ARRAY(SELECT AS STRUCT thread.thread_name AS threadName, thread.title AS title,
+        thread.subtitle AS subtitle, thread.crashed AS crashed, thread.blamed AS blamed,
+        ARRAY_LENGTH(thread.frames) AS frameCount,
+        ARRAY(SELECT AS STRUCT f.file AS file, f.line AS line, f.symbol AS symbol,
+            f.owner AS owner, f.library AS library, f.offset AS offset, f.address AS address,
+            f.blamed AS blamed
+          FROM UNNEST(thread.frames) AS f WITH OFFSET frame_index
+          ORDER BY frame_index LIMIT 100) AS frames
+      FROM UNNEST(threads) AS thread WITH OFFSET thread_index
+      ORDER BY thread.crashed DESC, thread.blamed DESC, thread_index LIMIT {_MAX_STACK_GROUPS}) AS threads,
     ARRAY(SELECT AS STRUCT b.name AS name, b.timestamp AS breadcrumbTime,
         ARRAY(SELECT AS STRUCT p.key AS key, p.value AS value
           FROM UNNEST(b.params) AS p
@@ -134,6 +132,8 @@ def _select_columns(table: str) -> str:
       FROM UNNEST(breadcrumbs) AS b
       WHERE b.timestamp <= event_timestamp
       ORDER BY b.timestamp DESC LIMIT {_MAX_BREADCRUMB_ROWS}) AS breadcrumbs,
+    STRUCT(memory.free AS free, memory.used AS used) AS memory,
+    process_state AS processState,
     device.manufacturer AS manufacturer,
     device.model AS model,
     device.architecture AS architecture,
@@ -318,18 +318,111 @@ def find_evidence(
     ):
         return _unavailable("조회한 발생 데이터의 버전 또는 시각이 알림과 일치하지 않습니다.")
 
-    frames: list[object] = [_field(row, "blameFrame")]
-    for name in ("exceptionFrames", "threadFrames"):
-        extra = _field(row, name)
-        if isinstance(extra, (list, tuple)):
-            frames.extend(extra)
-    frame = next((valid for valid in map(_valid_frame, frames) if valid is not None), None)
-    context = _event_context(row, event_time, found_display, found_build)
+    frame = _valid_frame(_field(row, "blameFrame"))
     if frame is None:
-        return {
-            "status": "unavailable",
-            "reason": "난독화가 해제된 앱 Kotlin 소스 프레임을 확인할 수 없습니다.",
-            **context,
-        }
-
+        for stack_key in ("exceptions", "threads"):
+            for group in _rows(_field(row, stack_key)):
+                for raw in _rows(_field(group, "frames")):
+                    frame = _valid_frame(raw)
+                    if frame is not None:
+                        break
+                if frame is not None:
+                    break
+            if frame is not None:
+                break
+    context = _event_context(row, event_time, found_display, found_build)
+    context["stackTrace"] = _stack_trace(row)
+    memory = _field(row, "memory")
+    context["memory"] = {
+        name: value for name in ("free", "used")
+        if isinstance(value := _field(memory, name), int) and not isinstance(value, bool) and value >= 0
+    }
+    context["processState"] = _safe_stack_text(_field(row, "processState"))
+    context["errorType"] = _safe_stack_text(_field(row, "errorType"))
     return {"status": "ready", "frame": frame, **context}
+
+
+def _rows(value: object) -> list[object]:
+    return list(value) if isinstance(value, (list, tuple)) else []
+
+
+def _safe_stack_text(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = safe_text(value, _MAX_STACK_TEXT).strip()
+    return text or None
+
+
+def _stack_frame(raw: object) -> dict[str, Any]:
+    def integer(name: str) -> int | None:
+        value = _field(raw, name)
+        return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+    blamed = _field(raw, "blamed")
+    return {
+        "file": _safe_stack_text(_field(raw, "file")),
+        "line": integer("line"),
+        "symbol": _safe_stack_text(_field(raw, "symbol")),
+        "owner": _safe_stack_text(_field(raw, "owner")),
+        "library": _safe_stack_text(_field(raw, "library")),
+        "offset": integer("offset"),
+        "address": integer("address"),
+        "blamed": blamed if isinstance(blamed, bool) else None,
+        "truncated": any(isinstance(value := _field(raw, name), str) and len(value) > _MAX_STACK_TEXT
+                         for name in ("file", "symbol", "owner", "library")),
+    }
+
+
+def _stack_trace(row: object) -> dict[str, Any]:
+    truncated = False
+    result: dict[str, Any] = {
+        "exceptions": [], "threads": [], "exceptionCount": 0, "threadCount": 0,
+        "truncated": False,
+    }
+    blame = _field(row, "blameFrame")
+    result["blameFrame"] = _stack_frame(blame) if blame is not None else None
+    if result["blameFrame"] is not None:
+        truncated |= result["blameFrame"]["truncated"]
+    for key, group_name, count_name in (
+        ("exceptions", "type", "exceptionCount"), ("threads", "threadName", "threadCount")
+    ):
+        groups = _rows(_field(row, key))
+        group_count = _field(row, count_name)
+        if not isinstance(group_count, int) or isinstance(group_count, bool) or group_count < 0:
+            group_count = len(groups)
+        result[count_name] = group_count
+        truncated |= group_count > _MAX_STACK_GROUPS
+        remaining = _MAX_STACK_FRAMES
+        for group in groups[:_MAX_STACK_GROUPS]:
+            raw_frames = _rows(_field(group, "frames"))
+            raw_count = _field(group, "frameCount")
+            if not isinstance(raw_count, int) or isinstance(raw_count, bool) or raw_count < 0:
+                raw_count = len(raw_frames)
+            take = min(len(raw_frames), remaining)
+            remaining -= take
+            truncated |= raw_count > take
+            blamed = _field(group, "blamed")
+            item: dict[str, Any] = {
+                group_name: _safe_stack_text(_field(group, group_name)),
+                "title": _safe_stack_text(_field(group, "title")),
+                "subtitle": _safe_stack_text(_field(group, "subtitle")),
+                "blamed": blamed if isinstance(blamed, bool) else None,
+                "frameCount": raw_count,
+                "frames": [_stack_frame(frame) for frame in raw_frames[:take]],
+            }
+            if key == "exceptions":
+                item["message"] = _safe_stack_text(_field(group, "message"))
+                nested = _field(group, "nested")
+                item["nested"] = nested if isinstance(nested, bool) else None
+            if key == "threads":
+                crashed = _field(group, "crashed")
+                item["crashed"] = crashed if isinstance(crashed, bool) else None
+            item["truncated"] = (
+                raw_count > take
+                or any(frame["truncated"] for frame in item["frames"])
+                or any(isinstance(value := _field(group, name), str) and len(value) > _MAX_STACK_TEXT
+                       for name in ("type", "title", "subtitle", "message", "threadName"))
+            )
+            truncated |= item["truncated"]
+            result[key].append(item)
+    result["truncated"] = truncated
+    return result

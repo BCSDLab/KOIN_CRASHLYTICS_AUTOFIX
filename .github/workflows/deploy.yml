@@ -34,6 +34,11 @@ jobs:
           python -m venv venv
           venv/bin/pip install --disable-pip-version-check --require-hashes -r requirements.txt
 
+      - name: Verify investigation regressions
+        run: |
+          venv/bin/pip install --disable-pip-version-check --require-hashes -r requirements-test.txt
+          venv/bin/python -m pytest -q tests
+
       - name: Write runtime configuration
         env:
           CRASHLYTICS_ENV: ${{ secrets.CRASHLYTICS_ENV }}
@@ -51,6 +56,7 @@ jobs:
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as output:
               output.write(f"GOOGLE_CLOUD_PROJECT={project}\n")
               output.write(f"GOOGLE_CLOUD_QUOTA_PROJECT={project}\n")
+              output.write(f"AUTOMATION_SERVICE_ACCOUNT={settings['AUTOMATION_SERVICE_ACCOUNT'].strip()}\n")
           PY
 
       - name: Authenticate to Google Cloud
@@ -58,6 +64,9 @@ jobs:
         with:
           credentials_json: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
           project_id: ${{ env.GOOGLE_CLOUD_PROJECT }}
+
+      - name: Set up task delivery IAM tooling
+        uses: google-github-actions/setup-gcloud@v3
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -67,8 +76,36 @@ jobs:
       - name: Register runtime secrets and deploy
         env:
           GITHUB_APP_PRIVATE_KEY: ${{ secrets.CRASHLYTICS_GITHUB_APP_PRIVATE_KEY }}
-          OPENAI_API_KEY: ${{ secrets.CRASHLYTICS_OPENAI_API_KEY }}
         run: |
           printf '%s' "$GITHUB_APP_PRIVATE_KEY" | npx --yes firebase-tools@15.35.0 functions:secrets:set CRASHLYTICS_GITHUB_APP_PRIVATE_KEY --data-file - --project "$GOOGLE_CLOUD_PROJECT" --non-interactive
-          printf '%s' "$OPENAI_API_KEY" | npx --yes firebase-tools@15.35.0 functions:secrets:set CRASHLYTICS_OPENAI_API_KEY --data-file - --project "$GOOGLE_CLOUD_PROJECT" --non-interactive
           npx --yes firebase-tools@15.35.0 deploy --only functions:crashlytics-issues --project "$GOOGLE_CLOUD_PROJECT" --non-interactive
+
+      - name: Preserve private pipeline invocation and worker task delivery
+        run: |
+          set -euo pipefail
+          for service in crashlyticsnewfatal crashlyticsnewnonfatal crashlyticsnewanr crashlyticsregression crashlyticsvelocity; do
+            gcloud run services add-iam-policy-binding "$service" --region us-east1 \
+              --member="serviceAccount:$AUTOMATION_SERVICE_ACCOUNT" --role=roles/run.invoker --quiet
+          done
+          for service in generatecrashlyticsfix mergecrashlyticsfix; do
+            gcloud run services add-iam-policy-binding "$service" --region us-central1 \
+              --member="serviceAccount:$AUTOMATION_SERVICE_ACCOUNT" --role=roles/run.invoker --quiet
+          done
+          deployer=$(gcloud config get-value account)
+          changed=false
+          for queue in generateCrashlyticsFix mergeCrashlyticsFix; do
+            for principal in "$AUTOMATION_SERVICE_ACCOUNT" "$deployer"; do
+              role=$(gcloud tasks queues get-iam-policy "$queue" --location us-central1 \
+                --flatten='bindings[].members' \
+                --filter="bindings.role=roles/cloudtasks.enqueuer AND bindings.members=serviceAccount:$principal" \
+                --format='value(bindings.role)')
+              if [[ "$role" != roles/cloudtasks.enqueuer ]]; then
+                gcloud tasks queues add-iam-policy-binding "$queue" --location us-central1 \
+                  --member="serviceAccount:$principal" --role=roles/cloudtasks.enqueuer --quiet
+                changed=true
+              fi
+            done
+          done
+          if [[ "$changed" == true ]]; then
+            sleep 120
+          fi

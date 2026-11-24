@@ -1,4 +1,4 @@
-"""Firebase entrypoints for issue-first repair, CI merge, and human fallback."""
+"""Firebase crash capture/outbox and verified CI merge entrypoints."""
 
 from __future__ import annotations
 
@@ -15,7 +15,6 @@ from google.cloud import bigquery
 
 from crashlytics_automation.github import create_github
 from crashlytics_automation.service import CrashAutomation
-from crashlytics_automation.openai_client import DEFAULT_MODEL
 from crashlytics_automation.task_payloads import MAX_FIX_RETRIES, MAX_MERGE_RETRIES, parse_firebase_alert
 from crashlytics_automation.repository import ANDROID_APPLICATION_ID
 
@@ -44,7 +43,6 @@ CONFIG = {
     'maximumBytesBilled': '1000000000',
 }
 PRIVATE_KEY = SecretParam('CRASHLYTICS_GITHUB_APP_PRIVATE_KEY')
-OPENAI_KEY = SecretParam('CRASHLYTICS_OPENAI_API_KEY')
 # CrashlyticsOptions in firebase-functions 0.6.0 drops per-trigger runtime options.
 options.set_global_options(
     service_account=SERVICE_ACCOUNT,
@@ -122,17 +120,14 @@ def crashlyticsVelocity(event: crashlytics_fn.CrashlyticsVelocityAlertEvent) -> 
     _receive(event)
 
 
-def _enqueue_merge(job: dict[str, Any]) -> None:
-    _enqueue_task('mergeCrashlyticsFix', f"{job['pullNumber']}/{job['headSha']}", job)
 
 
-@tasks_fn.on_task_dispatched(**{**TASK_OPTIONS, 'secrets': [PRIVATE_KEY, OPENAI_KEY], 'timeout_sec': 600})
+@tasks_fn.on_task_dispatched(**{**TASK_OPTIONS, 'secrets': [PRIVATE_KEY], 'timeout_sec': 600})
 def generateCrashlyticsFix(request: tasks_fn.CallableRequest) -> dict[str, Any]:
     automation = CrashAutomation(
-        _github({'contents': 'write', 'issues': 'write', 'pull_requests': 'write'}),
-        {**CONFIG, 'model': os.environ.get('OPENAI_MODEL', DEFAULT_MODEL), 'apiKey': OPENAI_KEY.value},
+        _github({'contents': 'write', 'issues': 'write'}),
+        CONFIG,
         bigquery_client=bigquery.Client(project=PROJECT_ID),
-        enqueue_merge=_enqueue_merge,
     )
     return automation.process_fix_task(request.data, retry_count=_retry_count(request))
 

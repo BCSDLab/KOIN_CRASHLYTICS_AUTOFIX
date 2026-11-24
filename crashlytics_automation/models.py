@@ -39,7 +39,7 @@ class SourceLocation:
 
     def __post_init__(self) -> None:
         if (not isinstance(self.path, str)
-                or re.fullmatch(r'(?:koin|data|domain|core(?:/[^/]+)?|feature/[^/]+)/src/main/(?:java|kotlin)/.+\.kt', self.path) is None
+                or re.fullmatch(r'(?:koin|data|domain|core(?:/[^/]+)?|feature/[^/]+)/src/main/(?:java|kotlin)/.+\.(?:kt|java)', self.path) is None
                 or '..' in self.path.split('/')
                 or type(self.line) is not int or not 0 < self.line <= 10_000_000):
             raise ValueError('Invalid released source location')

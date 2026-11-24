@@ -17,7 +17,8 @@ from .repository import REPOSITORY, TARGET_BRANCHES
 MAX_CANDIDATE_FILES = 24
 MAX_FILE_BYTES = 256 * 1024
 MAX_TOTAL_BYTES = 1024 * 1024
-MANIFEST_VERSION = 1
+MANIFEST_VERSION = 2
+LEGACY_MANIFEST_VERSION = 1
 
 SHA40 = re.compile(r'[0-9a-f]{40}')
 SHA64 = re.compile(r'[0-9a-f]{64}')
@@ -25,7 +26,7 @@ ISSUE_ID = re.compile(r'[A-Za-z0-9_-]{1,128}')
 MODULE = r'(?:domain|data|koin|core(?:/[A-Za-z0-9_-]{1,64})?|feature/[A-Za-z0-9_-]{1,64})'
 PACKAGE_DIR = r'[A-Za-z0-9_]+(?:/[A-Za-z0-9_]+)*'
 SOURCE_PATH = re.compile(
-    rf'^({MODULE})/src/main/(?:java|kotlin)/({PACKAGE_DIR})/([A-Za-z_][A-Za-z0-9_]*)\.kt$'
+    rf'^({MODULE})/src/main/(?:java|kotlin)/({PACKAGE_DIR})/([A-Za-z_][A-Za-z0-9_]*)\.(?:kt|java)$'
 )
 MODULE_PATH = re.compile(rf'^({MODULE})/src/')
 DECLARED_PACKAGE = re.compile(r'^[ \t]*package\s+([A-Za-z0-9_.`]+)', re.MULTILINE)
@@ -57,10 +58,18 @@ def sha256(value: str | bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def identity_hash_for(issue_id: Any) -> str:
+def _legacy_identity_hash_for(issue_id: Any) -> str:
     if not isinstance(issue_id, str) or not ISSUE_ID.fullmatch(issue_id):
         raise TypeError('Invalid Crashlytics issue ID')
     return sha256(f'{REPOSITORY}/{issue_id}')
+
+
+def identity_hash_for(issue_id: Any, source_sha: Any) -> str:
+    if not isinstance(issue_id, str) or not ISSUE_ID.fullmatch(issue_id):
+        raise TypeError('Invalid Crashlytics issue ID')
+    if not isinstance(source_sha, str) or not SHA40.fullmatch(source_sha):
+        raise TypeError('Invalid source SHA')
+    return sha256(f'{REPOSITORY}/{issue_id}/{source_sha}')
 
 
 def _require_identity_hash(identity_hash: Any) -> str:
@@ -90,8 +99,11 @@ def regression_test_name(identity_hash: Any) -> str:
 
 
 def _test_path_pattern(identity_hash: str) -> re.Pattern[str]:
-    name = re.escape(regression_test_name(identity_hash))
-    return re.compile(rf'^({MODULE})/src/test/(?:java|kotlin)/(?:({PACKAGE_DIR})/)?{name}$')
+    name = re.escape(regression_test_name(identity_hash).removesuffix('.kt'))
+    return re.compile(
+        rf'^({MODULE})/src/(?:test|androidTest)/(?:java|kotlin)/(?:({PACKAGE_DIR})/)?'
+        rf'{name}\.(?:kt|java)$'
+    )
 
 
 def module_for_path(path: Any) -> str | None:
@@ -235,15 +247,14 @@ def candidate_manifest(
     source_path: Any,
     files: Any,
 ) -> dict[str, Any]:
-    _require_identity_hash(identity_hash)
     if not isinstance(issue_id, str) or not ISSUE_ID.fullmatch(issue_id):
         raise TypeError('Invalid issue ID')
-    if identity_hash_for(issue_id) != identity_hash:
-        raise TypeError('Identity hash does not match issue ID')
     if not isinstance(base_sha, str) or not SHA40.fullmatch(base_sha):
         raise TypeError('Invalid base SHA')
     if not isinstance(source_sha, str) or not SHA40.fullmatch(source_sha):
         raise TypeError('Invalid source SHA')
+    if identity_hash_for(issue_id, source_sha) != identity_hash:
+        raise TypeError('Identity hash does not match issue and source')
     if not is_allowed_source_path(source_path):
         raise TypeError('Invalid source path')
     if not isinstance(files, list) or not files or len(files) > MAX_CANDIDATE_FILES:
@@ -307,17 +318,12 @@ def validate_manifest(manifest: Any, expected: Mapping[str, Any] | None = None) 
     expected = expected or {}
     if not _has_exact_keys(manifest, MANIFEST_KEYS):
         return {'valid': False, 'reason': 'manifest 형식이 올바르지 않습니다.'}
-    if type(manifest['version']) is not int or manifest['version'] != MANIFEST_VERSION:
+    version = manifest['version']
+    if type(version) is not int or version not in (LEGACY_MANIFEST_VERSION, MANIFEST_VERSION):
         return {'valid': False, 'reason': '지원하지 않는 manifest 버전입니다.'}
     issue_id = manifest['issueId']
     if not isinstance(issue_id, str) or not ISSUE_ID.fullmatch(issue_id):
         return {'valid': False, 'reason': 'manifest의 Crashlytics ID가 올바르지 않습니다.'}
-    identity_hash = manifest['identityHash']
-    if (
-        not isinstance(identity_hash, str) or not SHA64.fullmatch(identity_hash)
-        or identity_hash_for(issue_id) != identity_hash
-    ):
-        return {'valid': False, 'reason': 'manifest의 identityHash가 일치하지 않습니다.'}
     base_sha = manifest['baseSha']
     source_sha = manifest['sourceSha']
     if (
@@ -325,6 +331,14 @@ def validate_manifest(manifest: Any, expected: Mapping[str, Any] | None = None) 
         or not isinstance(source_sha, str) or not SHA40.fullmatch(source_sha)
     ):
         return {'valid': False, 'reason': 'manifest의 SHA 값이 올바르지 않습니다.'}
+    identity_hash = manifest['identityHash']
+    expected_identity = _legacy_identity_hash_for(issue_id) if version == LEGACY_MANIFEST_VERSION \
+        else identity_hash_for(issue_id, source_sha)
+    if (
+        not isinstance(identity_hash, str) or not SHA64.fullmatch(identity_hash)
+        or expected_identity != identity_hash
+    ):
+        return {'valid': False, 'reason': 'manifest의 identityHash가 일치하지 않습니다.'}
     if not is_allowed_source_path(manifest['sourcePath']):
         return {'valid': False, 'reason': 'manifest의 sourcePath가 허용되지 않습니다.'}
     for key in ('issueId', 'identityHash', 'baseSha', 'sourceSha', 'sourcePath'):

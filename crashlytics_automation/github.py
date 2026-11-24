@@ -48,7 +48,7 @@ class GitHub:
 
     def rest(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
         # API destinations are application-owned, never copied from crash reports.
-        if path != GRAPHQL_PATH and not path.startswith(f"{REPOSITORY_PATH}/") and not path.startswith(
+        if path not in (GRAPHQL_PATH, REPOSITORY_PATH) and not path.startswith(f"{REPOSITORY_PATH}/") and not path.startswith(
             "/search/issues?"
         ):
             raise ValueError("GitHub endpoint outside the configured repository")
@@ -77,6 +77,47 @@ class GitHub:
         if not isinstance(result, dict) or result.get("errors") or not isinstance(result.get("data"), dict):
             raise RuntimeError("GitHub GraphQL lookup failed")
         return result["data"]
+
+    def checkout(self, ref: str, directory: Any) -> None:
+        """Fetch an exact commit without persisting installation credentials in Git config."""
+        import base64
+        import os
+        import subprocess
+        from pathlib import Path
+
+        if not isinstance(ref, str) or re.fullmatch(r'[0-9a-f]{40}', ref) is None:
+            raise ValueError('Checkout requires a pinned commit')
+        destination = Path(directory)
+        destination.mkdir(parents=True, exist_ok=True)
+        if any(destination.iterdir()):
+            raise ValueError('Checkout destination must be empty')
+        environment = dict(os.environ)
+        for key in tuple(environment):
+            if key.startswith(('GIT_TRACE', 'GIT_CONFIG_')) or key == 'GIT_CURL_VERBOSE':
+                environment.pop(key, None)
+        authorization = base64.b64encode(f'x-access-token:{self._token}'.encode()).decode('ascii')
+        environment.update({
+            'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_TERMINAL_PROMPT': '0',
+            'GIT_CONFIG_COUNT': '4',
+            'GIT_CONFIG_KEY_0': 'http.https://github.com/.extraheader',
+            'GIT_CONFIG_VALUE_0': f'AUTHORIZATION: basic {authorization}',
+            'GIT_CONFIG_KEY_1': 'credential.helper', 'GIT_CONFIG_VALUE_1': '',
+            'GIT_CONFIG_KEY_2': 'core.hooksPath', 'GIT_CONFIG_VALUE_2': os.devnull,
+            'GIT_CONFIG_KEY_3': 'http.followRedirects', 'GIT_CONFIG_VALUE_3': 'false',
+        })
+        commands = [
+            ['git', 'init', '--quiet', str(destination)],
+            ['git', '-C', str(destination), 'fetch', '--quiet', '--depth=1',
+             f'https://github.com/{OWNER}/{REPO}.git', ref],
+            ['git', '-C', str(destination), 'checkout', '--quiet', '--detach', 'FETCH_HEAD'],
+        ]
+        for command in commands:
+            try:
+                result = subprocess.run(command, env=environment, capture_output=True, timeout=180, check=False)
+            except (OSError, subprocess.TimeoutExpired):
+                raise RuntimeError('Pinned source checkout could not complete') from None
+            if result.returncode:
+                raise RuntimeError(f'Pinned source checkout failed (exit {result.returncode})')
 
 
 def create_github(

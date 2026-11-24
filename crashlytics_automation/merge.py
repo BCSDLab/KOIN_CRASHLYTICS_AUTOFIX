@@ -16,7 +16,7 @@ import re
 from typing import Any
 from urllib.parse import quote
 
-from .candidate import MAX_FILE_BYTES, MAX_TOTAL_BYTES, branch_name_for, identity_hash_for, manifest_digest, manifest_path_for, sha256, validate_manifest
+from .candidate import MAX_FILE_BYTES, MAX_TOTAL_BYTES, branch_name_for, manifest_digest, manifest_path_for, sha256, validate_manifest
 from .github import OWNER, REPO, REPOSITORY_PATH
 from .pull_requests import CLOSURE_REFERENCE
 from .repository import TARGET_BRANCHES
@@ -213,8 +213,8 @@ def attempt_merge(github: Any, job: dict[str, Any], *, bot_login: str) -> dict[s
         return _blocked('pull request is not against the configured repository')
     if not _closes_tracked_issue(pr, job):
         return _blocked('pull request does not close exactly the tracked issue')
-    identity_hash = identity_hash_for(job['alert']['issueId'])
-    if _hotfix_identity(pr, target, bot_login) != identity_hash:
+    identity_hash = _hotfix_identity(pr, target, bot_login)
+    if identity_hash is None:
         return _blocked('pull request branch or author is not the automation identity')
     peer_merged, peer_error = _verify_peer_pull(github, job, pins, peer_target, identity_hash, bot_login)
     if peer_error is not None:

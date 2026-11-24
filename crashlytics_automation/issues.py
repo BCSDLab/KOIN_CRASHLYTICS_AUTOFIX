@@ -8,6 +8,7 @@ from typing import Any, Mapping
 from urllib.parse import quote
 
 from .github import OWNER, REPO, REPOSITORY_PATH, comment_once, find_issue, has_comment, issue_marker
+from .investigation_jobs import InvestigationQueue
 from .models import CrashAlert, CrashContext
 from .ownership import find_human_assignee
 from .privacy import safe_text
@@ -48,11 +49,6 @@ def event_marker(alert: CrashAlert) -> str:
     return f'<!-- crashlytics-event:{digest} -->'
 
 
-def find_manual_issue(github: Any, issue_id: str) -> dict[str, Any] | None:
-    issue = find_issue(github, issue_id)
-    if issue and (MANUAL_MARKER in (issue.get('body') or '') or has_comment(github, issue['number'], MANUAL_MARKER)):
-        return issue
-    return None
 
 
 def _crash_url(alert: CrashAlert, config: dict[str, Any]) -> str:
@@ -151,6 +147,7 @@ def _koin_version(alert: CrashAlert, evidence: dict[str, Any]) -> str:
 def _crash_report_body(context: CrashContext, reason: str, config: dict[str, Any]) -> str:
     alert, source = context.alert, context.source
     evidence = context.evidence if isinstance(context.evidence, dict) else {}
+    investigation = evidence.get('investigation') or {}
     title, subtitle = safe_text(alert.title), safe_text(alert.subtitle)
     lines = [
         '### 어떤 오류인가요?',
@@ -197,11 +194,28 @@ def _crash_report_body(context: CrashContext, reason: str, config: dict[str, Any
                   f'* {UNKNOWN} — 이벤트 로그에는 기대 동작이 기록되어 있지 않습니다.'])
     lines.extend(['', '### 예상되는 원인은 무엇인가요?', f'* 관찰된 예외: {subtitle or UNKNOWN}'])
     location = f'{safe_text(source.path)}:{source.line}' if source is not None else UNKNOWN
-    lines.append(f'* 관찰된 소스 위치: {location}')
-    lines.append(f'* 근본 원인: {UNKNOWN} — 로그와 이벤트만으로 원인을 확정할 수 없습니다.')
+    lines.append(f'* 조사로 확인한 소스 위치: {location}')
+    lines.append('* 근본 원인: 아래 자동 조사 결과 참조.'
+                 if investigation.get('analyses') else f'* 근본 원인: {UNKNOWN} — 아직 자동 조사가 완료되지 않았습니다.')
 
     lines.extend(['', '### 오류 사진을 올려주세요',
-                  f'* {UNKNOWN} — 이 자동화는 스크린샷을 내보내거나 첨부하지 않습니다.'])
+                  '* Crashlytics 원본 스크린샷은 제공되지 않습니다. 재현 산출물은 조사 실행에서 확인합니다.'])
+    analyses = investigation.get('analyses')
+    if isinstance(analyses, dict) and analyses:
+        lines.extend(['', '### 자동 조사 결과'])
+        for branch, result in analyses.items():
+            if not isinstance(result, dict):
+                continue
+            lines.append(f'#### {safe_text(branch, 40)}')
+            analysis = result.get('analysis')
+            if isinstance(analysis, str):
+                lines.extend(safe_text(line, 1000) for line in analysis[:6000].splitlines())
+            verification = result.get('verification')
+            if isinstance(verification, dict):
+                lines.append('* 독립 실행 검증: ' + ('수정 전 회귀 실패 · 수정 후 통과'
+                             if verification.get('passed') is True else safe_text(verification.get('reason', UNKNOWN), 1000)))
+            if result.get('source'):
+                lines.append(f'* 조사 대상: {safe_text(result["source"], 500)}')
 
     device, os_text = _environment_text(evidence)
     lines.extend(['', '### 오류가 발생한 환경을 알려주세요',
@@ -213,11 +227,26 @@ def _crash_report_body(context: CrashContext, reason: str, config: dict[str, Any
 
 
 def _progress_section(context: CrashContext, config: dict[str, Any]) -> str:
-    """Keep the full factual crash report in the issue, not only an event count."""
-    lines = [REPORT_START, _crash_report_body(context, '자동 수정 처리 중입니다.', config),
-             '', '### 자동 수정 진행 상황']
-    lines.append('* production → develop 순서로 머지하며, 두 PR 완료 후 이슈를 종료합니다.'
-                 if context.pull_numbers else '* AI 수정 PR: 아직 없음')
+    """Keep one current report and investigation result in the managed issue body."""
+    evidence = context.evidence if isinstance(context.evidence, dict) else {}
+    investigation = evidence.get('investigation') or {}
+    status = investigation.get('status')
+    stages = {
+        'queued': '격리 실행 환경에서 자동 조사할 차례를 기다리고 있습니다.',
+        'running': '소스·의존성 탐색과 재현 검증을 수행하고 있습니다.',
+        'delivering': '두 대상 PR의 머지 검증 작업을 전달하고 있습니다.',
+        'merging': 'production → develop 순서로 CI·머지 검증 중입니다.',
+        'complete': '두 대상 PR이 모두 머지됐습니다.',
+        'manual': investigation.get('reason') or '자동 조사 결과 사람의 판단이 필요합니다.',
+    }
+    reason = stages.get(status, 'Crashlytics 발생 근거를 준비하고 있습니다.')
+    lines = [REPORT_START, _crash_report_body(context, reason, config),
+             '', '### 자동 수정 진행 상황', f'* {safe_text(reason, 1000)}']
+    if context.pull_numbers:
+        lines.append('* 두 대상 PR을 검증하고 production → develop 순서로 머지한 뒤 이슈를 종료합니다.')
+    url = investigation.get('runUrl')
+    if isinstance(url, str) and re.fullmatch(r'https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/actions/runs/[0-9]+', url):
+        lines.append(f'* [자동 조사 실행]({url})')
     lines.append(REPORT_END)
     return '\n'.join(lines)
 
@@ -261,8 +290,6 @@ def ensure_crash_issue(github: Any, context: CrashContext, config: dict[str, Any
     issue = find_issue(github, alert.issue_id)
     if issue is not None:
         number = issue['number']
-        if MANUAL_MARKER in (issue.get('body') or '') or has_comment(github, number, MANUAL_MARKER):
-            return number
         if issue.get('state') != 'open':
             github.rest('PATCH', f'{REPOSITORY_PATH}/issues/{number}', {'state': 'open'})
         return number
@@ -287,6 +314,9 @@ def record_fix_progress(github: Any, context: CrashContext, config: dict[str, An
     issue = _tracker(github, context)
     body = issue.get('body') or ''
     updated = _with_report_section(body, _progress_section(context, config))
+    investigation = (context.evidence or {}).get('investigation') or {}
+    if investigation.get('status') in ('queued', 'running', 'delivering', 'merging', 'complete'):
+        updated = updated.replace(MANUAL_MARKER, '')
     for marker in (issue_marker(context.alert.issue_id), event_marker(context.alert)):
         if marker not in updated:
             updated += '\n\n' + marker
@@ -309,7 +339,12 @@ def close_fixed_issue(github: Any, context: CrashContext) -> None:
         raise ValueError('Invalid hotfix pull request numbers')
     issue = _tracker(github, context)
     body = issue.get('body') or ''
-    if MANUAL_MARKER in body or has_comment(github, issue['number'], MANUAL_MARKER):
+    investigation = InvestigationQueue(github).get(context.alert)
+    if investigation is not None:
+        numbers = {fix['pullNumber'] for fix in investigation['branches'].values()}
+        if investigation['status'] != 'complete' or numbers != set(context.pull_numbers):
+            return
+    elif MANUAL_MARKER in body or has_comment(github, issue['number'], MANUAL_MARKER):
         return
     root = f"{REPOSITORY_PATH}/issues/{issue['number']}"
     if issue.get('state') == 'closed':
@@ -353,7 +388,7 @@ def _reuse_tracker(github: Any, context: CrashContext) -> dict[str, Any] | None:
 
 def report_for_human(github: Any, context: CrashContext, reason: str,
                      config: dict[str, Any], *, failed_pr: int | None = None) -> dict[str, Any]:
-    """Create/comment once, then assign a human without overwriting concurrent work."""
+    """Update the issue report, then assign a human without duplicating it in comments."""
     if not isinstance(reason, str) or not reason.strip() or len(reason) > 4000:
         raise ValueError('Invalid manual handoff reason')
     alert = context.alert
@@ -374,8 +409,6 @@ def report_for_human(github: Any, context: CrashContext, reason: str,
         if issue.get('state') != 'open':
             github.rest('PATCH', f"{REPOSITORY_PATH}/issues/{issue['number']}", {'state': 'open'})
         existing, event = issue.get('body') or '', event_marker(alert)
-        if MANUAL_MARKER not in existing or event not in existing:
-            comment_once(github, issue['number'], MANUAL_MARKER + '\n' + event, body)
         updated = _with_report_section(existing, report)
         for marker in (issue_marker(alert.issue_id), MANUAL_MARKER, event):
             if marker not in updated:
