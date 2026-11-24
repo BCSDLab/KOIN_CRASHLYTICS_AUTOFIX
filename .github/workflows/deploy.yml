@@ -36,6 +36,9 @@ jobs:
 
       - name: Verify investigation regressions
         run: |
+          docker run --rm --network none -v "$PWD/.github/workflows:/workflows:ro" \
+            -w /workflows rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 \
+            -shellcheck= -pyflakes= deploy.yml investigate.yml
           venv/bin/pip install --disable-pip-version-check --require-hashes -r requirements-test.txt
           venv/bin/python -m pytest -q tests
 

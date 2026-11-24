@@ -25,7 +25,6 @@ jobs:
       CRASHLYTICS_ENV: ${{ secrets.CRASHLYTICS_ENV }}
       CRASHLYTICS_GITHUB_APP_PRIVATE_KEY: ${{ secrets.CRASHLYTICS_GITHUB_APP_PRIVATE_KEY }}
       INVESTIGATION_IMAGE: crashlytics-investigator:${{ github.run_id }}
-      INVESTIGATION_ARTIFACTS: ${{ runner.temp }}/crashlytics-artifacts
     steps:
       - name: Checkout trusted worker
         uses: actions/checkout@v4
@@ -76,6 +75,7 @@ jobs:
         env:
           ISSUE_NUMBER: ${{ steps.queue.outputs.issue_number }}
           CRASHLYTICS_OPENAI_API_KEY: ${{ secrets.CRASHLYTICS_OPENAI_API_KEY }}
+          INVESTIGATION_ARTIFACTS: ${{ runner.temp }}/crashlytics-artifacts
         run: python -m crashlytics_automation.worker --issue-number "$ISSUE_NUMBER"
 
       - name: Upload public-repository reproduction artifacts
