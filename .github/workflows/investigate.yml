@@ -9,16 +9,67 @@ on:
         description: Existing Android Crashlytics issue to investigate; empty processes the oldest queued incident
         type: string
         required: false
+      resume_manual:
+        description: Resume a manual source investigation from saved evidence, without a new capture
+        type: boolean
+        default: false
+      notes:
+        description: Additional research to verify; stored in the target investigation branch
+        type: string
+        required: false
 
 permissions:
   contents: read
 
-concurrency:
-  group: crashlytics-investigation-worker
-  cancel-in-progress: false
-
 jobs:
+  prepare:
+    if: github.event_name == 'workflow_dispatch' && (inputs.issue_number != '' || inputs.resume_manual || inputs.notes != '')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      CRASHLYTICS_ENV: ${{ secrets.CRASHLYTICS_ENV }}
+      CRASHLYTICS_GITHUB_APP_PRIVATE_KEY: ${{ secrets.CRASHLYTICS_GITHUB_APP_PRIVATE_KEY }}
+    steps:
+      - name: Checkout trusted request handler
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+
+      - name: Install request dependencies
+        run: python -m pip install --disable-pip-version-check --require-hashes -r requirements.txt
+
+      - name: Authenticate capture delivery
+        uses: google-github-actions/auth@v3
+        with:
+          credentials_json: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+
+      - name: Persist the explicit request before waiting for the worker
+        env:
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          RESUME_MANUAL: ${{ inputs.resume_manual }}
+          INVESTIGATION_NOTES: ${{ inputs.notes }}
+        run: |
+          args=()
+          if [[ -n "$ISSUE_NUMBER" ]]; then
+            args+=(--issue-number "$ISSUE_NUMBER")
+          fi
+          if [[ "$RESUME_MANUAL" == 'true' ]]; then
+            args+=(--resume-manual)
+          fi
+          python -m crashlytics_automation.worker --list-pending "${args[@]}"
+
   investigate:
+    needs: prepare
+    if: always() && (needs.prepare.result == 'success' || needs.prepare.result == 'skipped')
+    concurrency:
+      group: crashlytics-investigation-worker
+      cancel-in-progress: false
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:

@@ -79,12 +79,16 @@ def enqueue_task(config: dict[str, Any], function: str, identity: str, data: dic
         raise RuntimeError(f'Cloud Tasks delivery failed (HTTP {response.status_code})')
 
 
-def prepare_existing_issue(github: Any, config: dict[str, Any], issue_number: int) -> Any:
-    """Request one real evidence snapshot for a legacy issue, without inventing stack data."""
+def prepare_existing_issue(
+    github: Any, config: dict[str, Any], issue_number: int, *,
+    resume_manual: bool = False, notes: str | None = None,
+) -> Any:
+    """Capture once, or explicitly resume source investigation from existing evidence."""
     from .github import issue_marker
     from .investigation_jobs import InvestigationQueue, POLICY_VERSION
-    from .repository import REPOSITORY_PATH
+    from .repository import REPOSITORY_PATH, TARGET_BRANCHES
     from .task_payloads import parse_alert_payload
+    from .privacy import safe_text
 
     issue = github.rest('GET', f'{REPOSITORY_PATH}/issues/{issue_number}')
     body = issue.get('body') or ''
@@ -108,17 +112,37 @@ def prepare_existing_issue(github: Any, config: dict[str, Any], issue_number: in
     })
     queue = InvestigationQueue(github)
     job = queue.get(alert)
-    if job is not None:
-        return job
-    enqueue_task(config, 'generateCrashlyticsFix', alert.event_id, {'alert': alert.to_payload()})
-    # Await only the new snapshot. This never reruns the BQ query or model call.
-    deadline = time.monotonic() + 180
-    while time.monotonic() < deadline:
-        job = queue.get(alert)
-        if job is not None:
-            return job
-        time.sleep(5)
-    raise RuntimeError('Evidence snapshot task did not publish investigation state within three minutes')
+    if job is None:
+        if resume_manual:
+            raise ValueError('No saved evidence exists; resume never requests a new capture')
+        enqueue_task(config, 'generateCrashlyticsFix', alert.event_id, {'alert': alert.to_payload()})
+        deadline = time.monotonic() + 180
+        while time.monotonic() < deadline:
+            job = queue.get(alert)
+            if job is not None:
+                break
+            time.sleep(5)
+        if job is None:
+            raise RuntimeError('Evidence snapshot task did not publish investigation state within three minutes')
+    changed = False
+    if resume_manual:
+        if job['status'] not in ('manual', 'queued'):
+            raise ValueError('Only manual or queued source investigations can be resumed')
+        if all(branch in job['branches'] for branch in TARGET_BRANCHES):
+            raise ValueError('Both fixes already exist; source investigation must not be restarted')
+        job['status'] = 'queued'
+        job.pop('reason', None)
+        job.pop('reportPending', None)
+        changed = True
+    if notes:
+        if job['status'] != 'queued':
+            raise ValueError('Research notes require a queued or explicitly resumed investigation')
+        job['operatorNotes'] = safe_text(notes, 16_000)
+        changed = True
+    if changed:
+        queue.put(job)
+        _report(github, queue, job, config)
+    return job
 
 
 def _context(job: dict[str, Any]) -> Any:
@@ -283,15 +307,22 @@ def run_job(github: Any, config: dict[str, Any], job: dict[str, Any]) -> dict[st
                         context={
                             'issue': context.alert.to_payload(),
                             'repository': REPOSITORY, 'releaseSha': release, 'baseBranch': target,
+                            'operatorNotes': job.get('operatorNotes'),
+                            'priorInvestigations': job['analyses'],
                             'baseSha': base, 'crash': job['evidence'], 'identityHash': identity_hash,
                             'regressionTestName': regression_test_name(identity_hash),
                             'workspaces': {'release': '/workspace/release', 'target': '/workspace/target',
                                            'scratch': '/workspace/scratch'},
                         }, execute=sandbox.execute,
                     )
+                    if decision.get('toolResults'):
+                        (sandbox.artifact_directory / 'investigation-tool-results.json').write_text(
+                            json.dumps(decision['toolResults'], ensure_ascii=False, indent=2), encoding='utf-8',
+                        )
                     job['analyses'][target] = {
                         'analysis': decision['analysis'], 'reason': decision['reason'],
-                        'tools': [{'command': str(item.get('command', ''))[:500],
+                        'tools': [{'tool': item.get('tool', 'run_command'),
+                                   'command': str(item.get('command', ''))[:500],
                                    'exit_code': item.get('exit_code'), 'timed_out': item.get('timed_out')}
                                   for item in decision.get('toolResults', [])],
                     }
@@ -372,9 +403,13 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--list-pending', action='store_true')
     parser.add_argument('--issue-number', type=int)
+    parser.add_argument('--resume-manual', action='store_true')
     arguments = parser.parse_args()
     if arguments.issue_number is not None and arguments.issue_number < 1:
         parser.error('issue number must be positive')
+    notes = os.environ.get('INVESTIGATION_NOTES') or None
+    if (arguments.resume_manual or notes) and arguments.issue_number is None:
+        parser.error('manual resume and research notes require an issue number')
     config = runtime_config()
     github = worker_github()
     from .investigation_jobs import InvestigationQueue
@@ -382,8 +417,9 @@ def main() -> int:
     jobs = InvestigationQueue(github).pending()
     if arguments.issue_number is not None:
         jobs = [job for job in jobs if job['issueNumber'] == arguments.issue_number]
-        if not jobs:
-            prepared = prepare_existing_issue(github, config, arguments.issue_number)
+        if arguments.resume_manual or notes or not jobs:
+            prepared = prepare_existing_issue(github, config, arguments.issue_number,
+                                              resume_manual=arguments.resume_manual, notes=notes)
             if prepared['status'] == 'queued':
                 jobs = [prepared]
     if arguments.list_pending:

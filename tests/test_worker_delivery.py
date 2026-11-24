@@ -23,6 +23,9 @@ class Queue:
         self.latest = None
         self.history = []
 
+    def get(self, _alert):
+        return copy.deepcopy(self.latest)
+
     def put(self, job):
         self.latest = copy.deepcopy(job)
         self.history.append(copy.deepcopy(job))
@@ -293,3 +296,73 @@ def test_worker_configuration_builds_the_requested_android_crash_deep_link(monke
         'https://console.firebase.google.com/project/test-project/'
         'crashlytics/app/android:example.worker.app/issues/issue-1'
     )
+
+
+class ExistingIssueGithub(Github):
+    def rest(self, method, path, *_args, **_kwargs):
+        result = super().rest(method, path, *_args, **_kwargs)
+        if method == 'GET' and path.endswith('/issues/17'):
+            from crashlytics_automation.github import issue_marker
+            alert = ALERT.to_payload()
+            result['body'] = (
+                issue_marker(ALERT.issue_id)
+                + f"\n* 발생 버전: {alert['appVersion']}\n* 알림 시각: {alert['time']}\n"
+                + f"\n### 어떤 오류인가요?\n* {alert['title']}\n* {alert['subtitle']}\n"
+            )
+        return result
+
+
+@pytest.mark.parametrize('attempts', [1, 3])
+def test_manual_resume_reuses_captured_evidence_and_preserves_the_model_budget(monkeypatch, attempts):
+    from crashlytics_automation import issues
+
+    queue = Queue()
+    original = _base_job('manual')
+    original['reason'] = 'Previous investigation stopped without a runtime experiment'
+    original['attempts']['production'] = attempts
+    original['analyses']['production'] = {'analysis': 'Previous inspection', 'tools': []}
+    queue.latest = copy.deepcopy(original)
+    _patch_queue(monkeypatch, queue)
+    monkeypatch.setattr(worker, 'enqueue_task',
+                        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError('unexpected capture')))
+    reports = []
+    monkeypatch.setattr(issues, 'record_fix_progress', lambda _g, context, _c: reports.append(context))
+
+    resumed = worker.prepare_existing_issue(
+        ExistingIssueGithub(), {'botLogin': 'autofix[bot]'}, 17,
+        resume_manual=True, notes='Zero-width hypothesis; token=private-value',
+    )
+
+    assert resumed['status'] == queue.latest['status'] == 'queued'
+    assert resumed['alert'] == original['alert']
+    assert resumed['evidence'] == original['evidence']
+    assert resumed['attempts']['production'] == attempts
+    assert resumed['analyses'] == original['analyses']
+    assert 'private-value' not in resumed['operatorNotes']
+    assert 'reason' not in resumed and 'reportPending' not in resumed
+    assert reports[-1].evidence['investigation']['status'] == 'queued'
+
+
+def test_manual_resume_without_saved_evidence_cannot_request_another_capture(monkeypatch):
+    queue = Queue()
+    _patch_queue(monkeypatch, queue)
+    monkeypatch.setattr(worker, 'enqueue_task',
+                        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError('unexpected capture')))
+
+    with pytest.raises(ValueError):
+        worker.prepare_existing_issue(ExistingIssueGithub(), {}, 17, resume_manual=True)
+
+    assert queue.history == []
+
+
+@pytest.mark.parametrize('status', ['running', 'merging', 'complete'])
+def test_manual_resume_cannot_reopen_active_or_completed_work(monkeypatch, status):
+    queue = Queue()
+    original = _base_job(status)
+    queue.latest = copy.deepcopy(original)
+    _patch_queue(monkeypatch, queue)
+
+    with pytest.raises(ValueError):
+        worker.prepare_existing_issue(ExistingIssueGithub(), {}, 17, resume_manual=True)
+
+    assert queue.latest == original and queue.history == []

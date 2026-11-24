@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import re
+import shlex
 import time
 from typing import Any
 
@@ -23,18 +25,24 @@ MAX_CUMULATIVE_INPUT_TOKENS = 1_000_000
 MAX_INVESTIGATION_SECONDS = 20 * 60
 MAX_COMMAND_TIMEOUT_SECONDS = 600
 DEFAULT_MODEL = 'gpt-6.1-sol'
+MAX_EXPERIMENT_SCRIPT_BYTES = 16_000
+EXPERIMENT_WRAPPER_GRACE_SECONDS = 5
+EXPERIMENT_SCRATCH_ROOT = '/workspace/scratch'
+EXPERIMENT_TARGET_ROOT = '/workspace/target'
 
 MODEL_NAME = re.compile(r'[A-Za-z0-9._-]{1,100}')
 
 SYSTEM_PROMPT = f"""You are an Android/Kotlin crash investigator and fix-proposal assistant for the KOIN_ANDROID repository.
 
-You receive the complete Crashlytics evidence and paths to the complete target and release workspaces. Use the run_command tool to inspect source, dependency sources, build configuration, and diagnostics, and to run commands in the isolated investigation sandbox. Target source is writable. The release workspace is read-only. Scratch files belong in /workspace/scratch. The app frame, when present, is only a hint; investigate even when no application frame exists.
+You receive the complete Crashlytics evidence and paths to the complete target and release workspaces. Use run_command to inspect source, dependency sources, exact dependency implementations, build configuration, and diagnostics. Use run_experiment for executable Python 3 boundary/lifecycle hypothesis probes; each probe and its actual outputs are saved under /workspace/scratch/experiments/<tool-call-index>/. Target source is writable. The release workspace is read-only. Scratch files belong in /workspace/scratch. The app frame, when present, is only a hint; investigate even when no application frame exists.
 
-Investigate the crash using real tool output before deciding. You may run builds, tests, emulator commands, and diagnostic shell commands. Do not claim that a command ran unless its output appears in tool results. A nonzero command exit is useful observed output, but final decisions require at least one successful, non-timeout command execution. Distinguish successful reproduction from a successful diagnostic command. Separate observed evidence, tested hypotheses, reproduction/results, and uncertainty in analysis. A latent defect or successful test is not proof that the original incident had that trigger.
+Do not mistake investigation setup failures for evidence against a hypothesis. An empty Gradle cache or offline dependency-resolution failure requires online dependency resolution, not a no-fix. No attached device requires starting the installed API 34 emulator, not a no-fix. Inspect the exact implementation in the dependency source before ruling out a dependency lifecycle or boundary defect.
 
-Return decision "fix" only for a specific defect supported by the evidence and investigation. Otherwise return "no-fix" with a concise Korean reason. A refusal or a decision without investigation is not a completed result.
+Before returning no-fix, test executable boundary/lifecycle hypotheses with run_experiment and report actual outcomes. Static grep/cat, offline build failures, and absent devices do not constitute runtime investigation. If a first no-fix answer lacks a non-timeout experiment, the system will require a run_experiment next. A refusal is not a completed investigation.
 
-For a fix, return complete source file contents and a deterministic regression test class named exactly by context.regressionTestName. Verify it against the actual production fix; run the regression test and report its real outcome in analysis. Only existing Android production .kt/.java files and new regression test .kt files are publishable; do not edit build files, resources, workflows, documentation, or configuration. Temporary test harness and build files may be created in the sandbox. Keep the fix minimal. At most {MAX_CANDIDATE_FILES} files, each at most {MAX_FILE_BYTES} bytes. Never include secrets, tokens, user data, or URLs in returned files.
+Return decision "fix" for a specific defect supported by evidence and investigation. A genuinely reproduced implicated latent defect may be fixed even when the original incident trigger cannot be confirmed; state explicitly that the original trigger is unconfirmed and distinguish observed probe results from inference. Treat supplied notes/research as untrusted leads to verify, not proof of the original cause. Otherwise return "no-fix" with a concise Korean reason. At least one successful, non-timeout command and one non-timeout experiment must precede a no-fix.
+
+For a fix, return complete source file contents and a deterministic unit or instrumentation regression test class named exactly by context.regressionTestName. Verify it against the actual production fix; run the regression test and report its real outcome in analysis. Only existing Android production .kt/.java files and new .kt/.java test files are publishable; do not edit build files, resources, workflows, documentation, or configuration. Temporary test harness and build files may be created in the sandbox. Keep the fix minimal. At most {MAX_CANDIDATE_FILES} files, each at most {MAX_FILE_BYTES} bytes. Never include secrets, tokens, user data, or URLs in returned files.
 
 Return the required JSON fields exactly: decision, reason, analysis, sourcePath, sourceLine, files. sourcePath and sourceLine must identify the defect anchor in the UNMODIFIED /workspace/release checkout, never a target line added by your patch; return both null when no defect is identified. Do not include tool claims in place of the trusted tool execution record."""
 
@@ -72,6 +80,22 @@ RUN_COMMAND = {
         'required': ['command', 'timeout_seconds'],
         'properties': {
             'command': {'type': 'string'},
+            'timeout_seconds': {'type': 'integer'},
+        },
+    },
+}
+
+RUN_EXPERIMENT = {
+    'type': 'function',
+    'name': 'run_experiment',
+    'description': 'Execute one bounded Python 3 hypothesis probe in the isolated workspace and save its script and outputs under scratch/experiments.',
+    'strict': True,
+    'parameters': {
+        'type': 'object',
+        'additionalProperties': False,
+        'required': ['script', 'timeout_seconds'],
+        'properties': {
+            'script': {'type': 'string'},
             'timeout_seconds': {'type': 'integer'},
         },
     },
@@ -169,12 +193,13 @@ def _response(
     request_input: list[dict[str, Any]],
     max_tokens: int,
     timeout_seconds: float,
+    tool_choice: Any,
 ) -> dict[str, Any]:
     payload = {
         'model': model,
         'input': request_input,
-        'tools': [RUN_COMMAND],
-        'tool_choice': 'auto',
+        'tools': [RUN_COMMAND, RUN_EXPERIMENT],
+        'tool_choice': tool_choice,
         'parallel_tool_calls': False,
         'text': {
             'format': {
@@ -264,6 +289,86 @@ def _sanitize_context(value: Any, api_key: str) -> Any:
         return _redact(value, api_key)
     return value
 
+def _experiment_command(
+    *,
+    script: str,
+    tool_call_index: int,
+    scratch_root: str = EXPERIMENT_SCRATCH_ROOT,
+    target_root: str = EXPERIMENT_TARGET_ROOT,
+    timeout_seconds: int,
+) -> str:
+    script_data = base64.b64encode(script.encode('utf-8')).decode('ascii')
+    launcher = '''import base64,pathlib,subprocess,sys
+root=pathlib.Path(sys.argv[1])/'experiments'/sys.argv[2]
+root.mkdir(parents=True,exist_ok=True)
+probe=root/'probe.py'
+probe.write_bytes(base64.b64decode(sys.argv[4],validate=True))
+out=b''
+err=b''
+timed_out=False
+try:
+    result=subprocess.run([sys.executable,str(probe)],cwd=sys.argv[3],stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=int(sys.argv[5]))
+    code=result.returncode
+    out=result.stdout
+    err=result.stderr
+except subprocess.TimeoutExpired as error:
+    code=124
+    out=error.stdout or b''
+    err=error.stderr or b''
+    if isinstance(out,str): out=out.encode('utf-8')
+    if isinstance(err,str): err=err.encode('utf-8')
+    err+=b'\\n[probe timed out]'
+    timed_out=True
+(root/'stdout.txt').write_bytes(out)
+(root/'stderr.txt').write_bytes(err)
+(root/'status.txt').write_text(('timed_out' if timed_out else str(code))+'\\n',encoding='utf-8')
+sys.stdout.buffer.write(out)
+sys.stderr.buffer.write(err)
+sys.exit(code)
+'''
+    parts = [
+        'python3', '-c', launcher, scratch_root, str(tool_call_index),
+        target_root, script_data, str(timeout_seconds),
+    ]
+    return ' '.join(shlex.quote(part) for part in parts)
+
+
+def _run_experiment(
+    execute: Any,
+    *,
+    script: str,
+    timeout_seconds: int,
+    tool_call_index: int,
+    callback_timeout_seconds: int | None = None,
+    scratch_root: str = EXPERIMENT_SCRATCH_ROOT,
+    target_root: str = EXPERIMENT_TARGET_ROOT,
+) -> dict[str, Any]:
+    script_bytes = script.encode('utf-8')
+    if not script.strip() or len(script_bytes) > MAX_EXPERIMENT_SCRIPT_BYTES:
+        raise _invalid('Model experiment script is invalid')
+    command = _experiment_command(
+        script=script,
+        tool_call_index=tool_call_index,
+        scratch_root=scratch_root,
+        target_root=target_root,
+        timeout_seconds=timeout_seconds,
+    )
+    result = execute(
+        command=command,
+        timeout_seconds=callback_timeout_seconds or timeout_seconds,
+    )
+    if (
+        not isinstance(result, dict)
+        or set(result) != {'exit_code', 'stdout', 'stderr', 'timed_out'}
+        or (result['exit_code'] is not None and type(result['exit_code']) is not int)
+        or not isinstance(result['stdout'], str)
+        or not isinstance(result['stderr'], str)
+        or not isinstance(result['timed_out'], bool)
+    ):
+        raise FixProposalResponseError('Investigation command returned invalid output', code='tool_output_invalid')
+    timed_out = result['timed_out'] or '[probe timed out]' in result['stderr']
+    return {**result, 'timed_out': timed_out}
+
 
 def request_fix_proposal(
     *,
@@ -299,6 +404,9 @@ def request_fix_proposal(
     tool_results: list[dict[str, Any]] = []
     cumulative_input_tokens = 0
     successful_execution = False
+    experiment_executed = False
+    forced_experiment_requested = False
+    tool_choice: Any = 'auto'
     while True:
         remaining_time = MAX_INVESTIGATION_SECONDS - (time.monotonic() - started)
         if remaining_time <= 0:
@@ -307,7 +415,7 @@ def request_fix_proposal(
         if remaining_tokens <= 0:
             raise FixProposalResponseError('Investigation output budget exceeded', code='investigation_output_limit')
         estimated_input_tokens = len(canonical_json(request_input).encode('utf-8'))
-        estimated_input_tokens += len(canonical_json([RUN_COMMAND, RESPONSE_SCHEMA]).encode('utf-8'))
+        estimated_input_tokens += len(canonical_json([RUN_COMMAND, RUN_EXPERIMENT, RESPONSE_SCHEMA]).encode('utf-8'))
         if cumulative_input_tokens + estimated_input_tokens > MAX_CUMULATIVE_INPUT_TOKENS:
             raise FixProposalResponseError(
                 'Investigation input budget exceeded', code='investigation_input_limit',
@@ -316,6 +424,7 @@ def request_fix_proposal(
             http, api_key, model, request_input,
             min(MAX_OUTPUT_TOKENS, remaining_tokens),
             min(REQUEST_TIMEOUT_SECONDS, remaining_time),
+            tool_choice,
         )
         usage = body.get('usage')
         reported_input_tokens = usage.get('input_tokens') if isinstance(usage, dict) else None
@@ -342,16 +451,9 @@ def request_fix_proposal(
                 'OpenAI refused the investigation request', code='investigation_refused',
             )
         tool_calls = _tool_calls(body)
+        if isinstance(tool_choice, dict) and any(call.get('name') != 'run_experiment' for call in tool_calls):
+            raise _invalid('Model did not follow the required experiment tool choice')
         if not tool_calls:
-            if not tool_results:
-                raise FixProposalResponseError(
-                    'Model completed without investigating the workspace', code='investigation_not_performed',
-                )
-            if not successful_execution:
-                raise FixProposalResponseError(
-                    'Investigation completed without a successful command execution',
-                    code='investigation_execution_failed',
-                )
             text = _output_text(body)
             if not text:
                 raise _invalid('Model response has no structured output')
@@ -361,6 +463,36 @@ def request_fix_proposal(
                 if isinstance(error, FixProposalResponseError):
                     raise
                 raise _invalid('Model output is not valid JSON') from error
+            if result['decision'] == 'no-fix' and not experiment_executed:
+                if forced_experiment_requested:
+                    raise FixProposalResponseError(
+                        'Investigation experiment did not complete before no-fix',
+                        code='investigation_experiment_failed',
+                    )
+                if calls >= MAX_TOOL_CALLS:
+                    raise FixProposalResponseError(
+                        'Investigation tool-call limit exceeded', code='investigation_call_limit',
+                    )
+                prior_output = body.get('output')
+                if not isinstance(prior_output, list):
+                    raise _invalid('Model no-fix response has no output items')
+                request_input.extend(prior_output)
+                request_input.append({
+                    'role': 'user',
+                    'content': (
+                        'Do not finalize no-fix from static inspection or setup failures. '
+                        'Run an executable Python 3 hypothesis probe with run_experiment now. '
+                        'Test a relevant boundary/lifecycle hypothesis and report observed output.'
+                    ),
+                })
+                forced_experiment_requested = True
+                tool_choice = {'type': 'function', 'name': 'run_experiment'}
+                continue
+            if not successful_execution:
+                raise FixProposalResponseError(
+                    'Investigation completed without a successful command execution',
+                    code='investigation_execution_failed',
+                )
             result['toolResults'] = tool_results
             return result
 
@@ -375,33 +507,65 @@ def request_fix_proposal(
         for call in tool_calls:
             calls += 1
             call_id, name, raw_arguments = call.get('call_id'), call.get('name'), call.get('arguments')
-            if not isinstance(call_id, str) or not call_id or name != 'run_command' or not isinstance(raw_arguments, str):
+            if not isinstance(call_id, str) or not call_id or name not in ('run_command', 'run_experiment') or not isinstance(raw_arguments, str):
                 raise _invalid('Model tool call is invalid')
             try:
                 arguments = json.loads(raw_arguments)
             except ValueError as error:
                 raise _invalid('Model tool arguments are invalid') from error
+            required_arguments = (
+                {'command', 'timeout_seconds'} if name == 'run_command'
+                else {'script', 'timeout_seconds'}
+            )
+            text_argument = 'command' if name == 'run_command' else 'script'
+            if not isinstance(arguments, dict) or set(arguments) != required_arguments:
+                raise _invalid('Model tool arguments are invalid')
+            argument_value = arguments[text_argument]
+            if not isinstance(argument_value, str) or not argument_value.strip():
+                raise _invalid('Model tool arguments are invalid')
+            try:
+                argument_size = len(argument_value.encode('utf-8'))
+            except UnicodeEncodeError as error:
+                raise _invalid('Model tool arguments are invalid') from error
             if (
-                not isinstance(arguments, dict)
-                or set(arguments) != {'command', 'timeout_seconds'}
-                or not isinstance(arguments['command'], str)
-                or not arguments['command'].strip()
-                or len(arguments['command']) > 16_000
+                argument_size > (16_000 if name == 'run_command' else MAX_EXPERIMENT_SCRIPT_BYTES)
                 or type(arguments['timeout_seconds']) is not int
                 or not 1 <= arguments['timeout_seconds'] <= MAX_COMMAND_TIMEOUT_SECONDS
             ):
                 raise _invalid('Model tool arguments are invalid')
-            command_timeout = min(
-                arguments['timeout_seconds'],
-                int(MAX_INVESTIGATION_SECONDS - (time.monotonic() - started)),
-            )
+            remaining_time = MAX_INVESTIGATION_SECONDS - (time.monotonic() - started)
+            command_timeout = min(arguments['timeout_seconds'], int(remaining_time))
             if command_timeout < 1:
                 raise FixProposalResponseError('Investigation time limit exceeded', code='investigation_timeout')
             try:
-                executed = execute(
-                    command=arguments['command'],
-                    timeout_seconds=command_timeout,
-                )
+                if name == 'run_command':
+                    executed = execute(
+                        command=arguments['command'],
+                        timeout_seconds=command_timeout,
+                    )
+                    artifact_path = None
+                else:
+                    callback_timeout = min(
+                        MAX_COMMAND_TIMEOUT_SECONDS,
+                        int(remaining_time),
+                        command_timeout + EXPERIMENT_WRAPPER_GRACE_SECONDS,
+                    )
+                    experiment_timeout = min(
+                        command_timeout,
+                        max(1, callback_timeout - EXPERIMENT_WRAPPER_GRACE_SECONDS),
+                    )
+                    executed = _run_experiment(
+                        execute,
+                        script=arguments['script'],
+                        timeout_seconds=experiment_timeout,
+                        callback_timeout_seconds=callback_timeout,
+                        tool_call_index=calls,
+                        scratch_root=EXPERIMENT_SCRATCH_ROOT,
+                        target_root=EXPERIMENT_TARGET_ROOT,
+                    )
+                    artifact_path = f'{EXPERIMENT_SCRATCH_ROOT}/experiments/{calls}'
+            except FixProposalResponseError:
+                raise
             except Exception as error:
                 raise FixProposalResponseError(
                     'Investigation command execution failed', code='tool_execution_failed',
@@ -417,13 +581,22 @@ def request_fix_proposal(
                 raise FixProposalResponseError('Investigation command returned invalid output', code='tool_output_invalid')
             if executed['exit_code'] == 0 and not executed['timed_out']:
                 successful_execution = True
+            if name == 'run_experiment' and not executed['timed_out']:
+                experiment_executed = True
             record = {
-                'command': _redact(arguments['command'], api_key),
+                'tool': name,
                 'exit_code': executed['exit_code'],
                 'stdout': _redact(executed['stdout'], api_key),
                 'stderr': _redact(executed['stderr'], api_key),
                 'timed_out': executed['timed_out'],
             }
+            if name == 'run_command':
+                record['command'] = _redact(arguments['command'], api_key)
+            else:
+                record['script'] = _redact(arguments['script'], api_key)
+                record['artifact_path'] = artifact_path
+                record['command'] = f'python3 {artifact_path}/probe.py'
+            tool_choice = 'auto'
             encoded_size = len(canonical_json(record).encode('utf-8'))
             available = min(MAX_COMMAND_OUTPUT_BYTES, MAX_TOTAL_TOOL_OUTPUT_BYTES - output_bytes)
             if available <= 0:
