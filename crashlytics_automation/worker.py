@@ -47,7 +47,6 @@ def worker_github() -> Any:
         os.environ['CRASHLYTICS_GITHUB_APP_ID'], os.environ['CRASHLYTICS_GITHUB_INSTALLATION_ID'],
         os.environ['CRASHLYTICS_GITHUB_APP_PRIVATE_KEY'],
         permissions={'contents': 'write', 'issues': 'write', 'pull_requests': 'write'},
-        include_state=True,
     )
 
 

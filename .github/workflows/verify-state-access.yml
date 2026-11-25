@@ -34,10 +34,7 @@ jobs:
 
           runtime_config()
           from crashlytics_automation.repository import OWNER, REPO
-          owner, state_repo = os.environ['GITHUB_REPOSITORY'].split('/')
-          if owner != OWNER:
-              raise ValueError('State and application repositories must have the same installation owner')
-          repositories = sorted({REPO, state_repo})
+          repositories = [REPO]
           now = int(time.time())
           app_jwt = jwt.encode(
               {'iat': now - 60, 'exp': now + 600, 'iss': os.environ['CRASHLYTICS_GITHUB_APP_ID']},
@@ -59,8 +56,8 @@ jobs:
           )
           listed.raise_for_status()
           available = {item['full_name'] for item in listed.json()['repositories']}
-          expected = {owner + '/' + name for name in repositories}
-          if not expected <= available:
-              raise RuntimeError('Existing installation scope does not contain both repositories')
+          expected = {OWNER + '/' + REPO}
+          if available != expected:
+              raise RuntimeError('Existing installation must remain scoped to the application repository')
           print('Confirmed existing contents:write access: ' + ', '.join(sorted(expected)))
           PY

@@ -60,7 +60,6 @@ def _github(permissions: dict[str, str]) -> Any:
         _required_env('CRASHLYTICS_GITHUB_INSTALLATION_ID'),
         PRIVATE_KEY.value,
         permissions=permissions,
-        include_state=True,
     )
 
 

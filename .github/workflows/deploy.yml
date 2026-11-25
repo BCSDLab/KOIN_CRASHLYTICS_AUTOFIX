@@ -42,7 +42,7 @@ jobs:
           venv/bin/pip install --disable-pip-version-check --require-hashes -r requirements-test.txt
           venv/bin/python -m pytest -q tests
 
-      - name: Verify existing state repository access
+      - name: Verify existing investigation state access
         env:
           CRASHLYTICS_ENV: ${{ secrets.CRASHLYTICS_ENV }}
           CRASHLYTICS_GITHUB_APP_PRIVATE_KEY: ${{ secrets.CRASHLYTICS_GITHUB_APP_PRIVATE_KEY }}
@@ -51,14 +51,14 @@ jobs:
           from crashlytics_automation.worker import runtime_config, worker_github
           runtime_config()
           from crashlytics_automation.github import GitHubError
-          from crashlytics_automation.repository import STATE_REPOSITORY_PATH, STATE_REFERENCE
+          from crashlytics_automation.repository import REPOSITORY_PATH, STATE_REFERENCE
           github = worker_github()
           try:
-              github.rest('GET', STATE_REPOSITORY_PATH + '/git/ref/' + STATE_REFERENCE.removeprefix('refs/'))
+              github.rest('GET', REPOSITORY_PATH + '/git/ref/' + STATE_REFERENCE.removeprefix('refs/'))
           except GitHubError as error:
               if error.status != 404:
                   raise
-          print('Existing application and metadata repository access verified')
+          print('Existing application repository and non-branch state access verified')
           PY
 
       - name: Write runtime configuration
