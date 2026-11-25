@@ -1,4 +1,4 @@
-"""Durable investigation outbox on an orphan Git branch, not duplicate issue comments."""
+"""Durable investigation state in an automation-repository metadata ref, not app branches."""
 
 from __future__ import annotations
 
@@ -10,10 +10,9 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from .models import CrashAlert
-from .repository import REPOSITORY, REPOSITORY_PATH, TARGET_BRANCHES
+from .repository import REPOSITORY, STATE_REPOSITORY_PATH, STATE_REFERENCE, TARGET_BRANCHES
 from .task_payloads import parse_alert_payload
 
-STATE_BRANCH = 'automation/crashlytics-investigations'
 POLICY_VERSION = 2
 MAX_JOB_BYTES = 512 * 1024
 LEASE_MINUTES = 50
@@ -40,6 +39,7 @@ def new_job(alert: CrashAlert, evidence: dict[str, Any], issue_number: int) -> d
         'evidence': evidence,
         'branches': {},
         'analyses': {},
+        'branchBases': {},
         'attempts': {},
     }
 
@@ -72,6 +72,12 @@ def validate_job(job: Any) -> None:
         for field, size in (('headSha', 40), ('baseSha', 40), ('manifestDigest', 64)):
             if not isinstance(fix.get(field), str) or re.fullmatch(r'[0-9a-f]{' + str(size) + '}', fix[field]) is None:
                 raise ValueError('Invalid investigation publication digest')
+    origins = job.get('branchBases', {})
+    if not isinstance(origins, dict) or any(
+        branch not in TARGET_BRANCHES or not isinstance(sha, str) or _SHA.fullmatch(sha) is None
+        for branch, sha in origins.items()
+    ):
+        raise ValueError('Invalid production branch origin')
     release = job.get('releaseSha')
     if release is not None and (not isinstance(release, str) or _SHA.fullmatch(release) is None):
         raise ValueError('Invalid investigation release SHA')
@@ -98,20 +104,20 @@ class InvestigationQueue:
 
     def _head(self) -> str | None:
         try:
-            result = self.github.rest('GET', f'{REPOSITORY_PATH}/git/ref/heads/{STATE_BRANCH}')
+            result = self.github.rest('GET', f'{STATE_REPOSITORY_PATH}/git/ref/{STATE_REFERENCE.removeprefix("refs/")}')
         except Exception as error:
             if getattr(error, 'status', None) == 404:
                 return None
             raise
         value = (result.get('object') or {}).get('sha') if isinstance(result, dict) else None
         if not isinstance(value, str) or _SHA.fullmatch(value) is None:
-            raise ValueError('Invalid investigation state branch')
+            raise ValueError('Invalid investigation metadata reference')
         return value
 
     def _entries(self, head: str | None) -> dict[str, str]:
         if head is None:
             return {}
-        result = self.github.rest('GET', f'{REPOSITORY_PATH}/git/trees/{head}?recursive=1')
+        result = self.github.rest('GET', f'{STATE_REPOSITORY_PATH}/git/trees/{head}?recursive=1')
         if not isinstance(result, dict) or result.get('truncated') or not isinstance(result.get('tree'), list):
             raise RuntimeError('Incomplete investigation queue listing')
         return {
@@ -124,7 +130,7 @@ class InvestigationQueue:
         }
 
     def _read(self, identity: str, blob_sha: str) -> dict[str, Any]:
-        result = self.github.rest('GET', f'{REPOSITORY_PATH}/git/blobs/{blob_sha}')
+        result = self.github.rest('GET', f'{STATE_REPOSITORY_PATH}/git/blobs/{blob_sha}')
         if not isinstance(result, dict) or result.get('encoding') != 'base64':
             raise ValueError('Invalid investigation state blob')
         encoded = result.get('content')
@@ -163,7 +169,7 @@ class InvestigationQueue:
         if len(raw) > MAX_JOB_BYTES:
             raise ValueError('Investigation state is too large')
         expected = job.get('_blobSha')
-        blob = self.github.rest('POST', f'{REPOSITORY_PATH}/git/blobs', {
+        blob = self.github.rest('POST', f'{STATE_REPOSITORY_PATH}/git/blobs', {
             'content': base64.b64encode(raw).decode('ascii'), 'encoding': 'base64',
         })
         blob_sha = blob.get('sha') if isinstance(blob, dict) else None
@@ -189,20 +195,20 @@ class InvestigationQueue:
                     changed.append({'path': index_path, 'mode': '100644', 'type': 'blob', 'sha': None})
             tree_body: dict[str, Any] = {'tree': changed}
             if head is not None:
-                parent = self.github.rest('GET', f'{REPOSITORY_PATH}/git/commits/{head}')
+                parent = self.github.rest('GET', f'{STATE_REPOSITORY_PATH}/git/commits/{head}')
                 tree_body['base_tree'] = parent['tree']['sha']
-            tree = self.github.rest('POST', f'{REPOSITORY_PATH}/git/trees', tree_body)
-            commit = self.github.rest('POST', f'{REPOSITORY_PATH}/git/commits', {
+            tree = self.github.rest('POST', f'{STATE_REPOSITORY_PATH}/git/trees', tree_body)
+            commit = self.github.rest('POST', f'{STATE_REPOSITORY_PATH}/git/commits', {
                 'message': f'Investigation {job["id"][:12]}: {job["status"]}',
                 'tree': tree['sha'], 'parents': [head] if head else [],
             })
             try:
                 if head is None:
-                    self.github.rest('POST', f'{REPOSITORY_PATH}/git/refs', {
-                        'ref': f'refs/heads/{STATE_BRANCH}', 'sha': commit['sha'],
+                    self.github.rest('POST', f'{STATE_REPOSITORY_PATH}/git/refs', {
+                        'ref': STATE_REFERENCE, 'sha': commit['sha'],
                     })
                 else:
-                    self.github.rest('PATCH', f'{REPOSITORY_PATH}/git/refs/heads/{STATE_BRANCH}', {
+                    self.github.rest('PATCH', f'{STATE_REPOSITORY_PATH}/git/refs/{STATE_REFERENCE.removeprefix("refs/")}', {
                         'sha': commit['sha'], 'force': False,
                     })
             except Exception as error:
@@ -211,4 +217,4 @@ class InvestigationQueue:
                 raise
             job['_blobSha'] = blob_sha
             return
-        raise JobConflict('Investigation state branch changed concurrently')
+        raise JobConflict('Investigation metadata reference changed concurrently')

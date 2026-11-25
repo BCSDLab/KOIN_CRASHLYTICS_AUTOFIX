@@ -106,6 +106,7 @@ def test_resumed_production_publication_is_retained_and_develop_stays_pending(mo
     job = _base_job()
     job['attempts']['production'] = attempts
     job['sources'] = {'production': _source()}
+    job['branchBases'] = {'production': BASE_SHA}
     resumed = _fix('production', 21)
     calls = {'existing': [], 'model': 0}
     monkeypatch.setattr(issues, 'verify_crash_issue', lambda *_a, **_k: None)
@@ -134,6 +135,7 @@ def test_interrupted_merge_delivery_retries_durable_outbox_with_same_task_identi
     fixes = {'production': _fix('production', 31), 'develop': _fix('develop', 32)}
     job['branches'] = {branch: fix.to_payload() for branch, fix in fixes.items()}
     job['sources'] = {branch: _source() for branch in fixes}
+    job['branchBases'] = {branch: BASE_SHA for branch in fixes}
     calls = []
     fail_once = {'value': True}
     monkeypatch.setattr(issues, 'verify_crash_issue', lambda *_a, **_k: None)
@@ -164,7 +166,8 @@ def test_interrupted_merge_delivery_retries_durable_outbox_with_same_task_identi
     assert queue.latest['status'] == 'merging'
 
 
-def test_failed_trusted_verification_reports_analysis_without_publishing(monkeypatch):
+@pytest.mark.parametrize('target', ['production', 'develop'])
+def test_failed_trusted_verification_reports_analysis_without_publishing(monkeypatch, target):
     from crashlytics_automation import issues
 
     identity = identity_hash_for(ALERT.issue_id, RELEASE_SHA)
@@ -178,7 +181,11 @@ def test_failed_trusted_verification_reports_analysis_without_publishing(monkeyp
         'sourceLine': 2,
         'files': [
             {'path': SOURCE_PATH, 'content': 'package org.koin\nclass Thing { fun value() = 2 }\n'},
-            {'path': test_path, 'content': 'package org.koin\nclass RegressionTest\n'},
+            {'path': test_path, 'content': (
+                'package org.koin\nimport org.junit.Test\nimport org.junit.Assert.assertTrue\n'
+                + f'class {regression_test_name(identity)[:-3]} {{\n'
+                + '    @Test fun valueIsPositive() { assertTrue(Thing().value() > 0) }\n}\n'
+            )},
         ],
     }
 
@@ -220,22 +227,27 @@ def test_failed_trusted_verification_reports_analysis_without_publishing(monkeyp
     monkeypatch.setattr('crashlytics_automation.release_source.resolve_release_commit',
                         lambda *_a, **_k: RELEASE_SHA)
     monkeypatch.setattr('crashlytics_automation.pull_requests.branch_head_sha',
-                        lambda *_a, **_k: BASE_SHA)
+                        lambda _g, branch: BASE_SHA if branch == 'production' else '9' * 40)
     monkeypatch.setattr('crashlytics_automation.openai_client.request_fix_proposal',
                         lambda **_kwargs: decision)
     monkeypatch.setattr('crashlytics_automation.sandbox.InvestigationSandbox', FailedVerificationSandbox)
 
     monkeypatch.setenv('CRASHLYTICS_OPENAI_API_KEY', 'test-only')
-    result = worker.run_job(CheckedOutGithub(), {'botLogin': 'autofix[bot]'}, _base_job())
+    job = _base_job()
+    if target == 'develop':
+        job['branches']['production'] = _fix('production', 21).to_payload()
+        job['sources'] = {'production': _source()}
+        job['branchBases'] = {'production': BASE_SHA}
+    result = worker.run_job(CheckedOutGithub(), {'botLogin': 'autofix[bot]'}, job)
 
     assert result == {'outcome': 'manual'}
     assert queue.latest['status'] == 'manual'
-    assert queue.latest['analyses']['production']['analysis'] == decision['analysis']
-    assert queue.latest['analyses']['production']['verification'] == {
+    assert queue.latest['analyses'][target]['analysis'] == decision['analysis']
+    assert queue.latest['analyses'][target]['verification'] == {
         'passed': False, 'reason': 'Regression test passed before the fix.',
     }
     assert reports and reports[0][1] == 'Regression test passed before the fix.'
-    assert reports[0][0].evidence['investigation']['analyses']['production']['analysis'] == decision['analysis']
+    assert reports[0][0].evidence['investigation']['analyses'][target]['analysis'] == decision['analysis']
     assert publications == []
 
 
@@ -249,6 +261,7 @@ def test_report_failure_preserves_accepted_merge_tasks_and_retries_only_the_repo
     fixes = {'production': _fix('production', 31), 'develop': _fix('develop', 32)}
     job['branches'] = {branch: fix.to_payload() for branch, fix in fixes.items()}
     job['sources'] = {branch: _source() for branch in fixes}
+    job['branchBases'] = {branch: BASE_SHA for branch in fixes}
     deliveries = []
     reports = []
     monkeypatch.setattr(issues, 'verify_crash_issue', lambda *_a, **_k: None)

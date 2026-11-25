@@ -47,6 +47,7 @@ def worker_github() -> Any:
         os.environ['CRASHLYTICS_GITHUB_APP_ID'], os.environ['CRASHLYTICS_GITHUB_INSTALLATION_ID'],
         os.environ['CRASHLYTICS_GITHUB_APP_PRIVATE_KEY'],
         permissions={'contents': 'write', 'issues': 'write', 'pull_requests': 'write'},
+        include_state=True,
     )
 
 
@@ -197,8 +198,12 @@ def _deliver(github: Any, queue: Any, job: dict[str, Any], config: dict[str, Any
     release = job.get('releaseSha') or next(iter(job['sources'].values()))['sourceSha']
     fixes = []
     for target in TARGET_BRANCHES:
+        origin = job.get('branchBases', {}).get(target)
+        if origin is None:
+            raise ValueError('Published PR has no recorded production origin')
         fix = existing_fix(github, alert=context.alert, issue_number=context.issue_number,
-                           base_branch=target, bot_login=config['botLogin'], release_sha=release)
+                           base_branch=target, bot_login=config['botLogin'], release_sha=release,
+                           branch_base_sha=origin)
         if fix is None or isinstance(fix, ManualReview) or fix.to_payload()['headSha'] != job['branches'][target]['headSha']:
             raise ValueError('Published PR changed before merge delivery')
         fixes.append(fix)
@@ -272,8 +277,12 @@ def run_job(github: Any, config: dict[str, Any], job: dict[str, Any]) -> dict[st
             if isinstance(release, ManualReview):
                 raise ValueError(release.reason)
         job['releaseSha'] = release
+        origin = job.get('branchBases', {}).get(target)
+        if origin is None:
+            origin = branch_head_sha(github, 'production')
         resumed = existing_fix(github, alert=context.alert, issue_number=context.issue_number,
-                               base_branch=target, bot_login=config['botLogin'], release_sha=release)
+                               base_branch=target, bot_login=config['botLogin'], release_sha=release,
+                               branch_base_sha=origin)
         if isinstance(resumed, ManualReview):
             raise ValueError(resumed.reason)
         checkpointed = False
@@ -284,12 +293,14 @@ def run_job(github: Any, config: dict[str, Any], job: dict[str, Any]) -> dict[st
         else:
             if attempts >= 3:
                 raise RuntimeError('The investigation execution limit was reached')
-            base = branch_head_sha(github, target)
+            branch_base = branch_head_sha(github, 'production')
+            base = branch_base if target == 'production' else branch_head_sha(github, target)
+            job.setdefault('branchBases', {})[target] = branch_base
             identity_hash = identity_hash_for(context.alert.issue_id, release)
             with tempfile.TemporaryDirectory(prefix='crashlytics-investigation-') as temporary:
                 root = Path(temporary)
                 github.checkout(release, root / 'release')
-                github.checkout(base, root / 'target')
+                github.checkout(branch_base, root / 'target')
                 repository = github.rest('GET', REPOSITORY_PATH)
                 with InvestigationSandbox(
                     release=root / 'release', target=root / 'target',
@@ -306,10 +317,11 @@ def run_job(github: Any, config: dict[str, Any], job: dict[str, Any]) -> dict[st
                         api_key=os.environ['CRASHLYTICS_OPENAI_API_KEY'],
                         context={
                             'issue': context.alert.to_payload(),
-                            'repository': REPOSITORY, 'releaseSha': release, 'baseBranch': target,
+                            'repository': REPOSITORY, 'releaseSha': release, 'baseBranch': 'production',
+                            'pullRequestTarget': target, 'pullRequestBaseSha': base,
                             'operatorNotes': job.get('operatorNotes'),
                             'priorInvestigations': job['analyses'],
-                            'baseSha': base, 'crash': job['evidence'], 'identityHash': identity_hash,
+                            'baseSha': branch_base, 'crash': job['evidence'], 'identityHash': identity_hash,
                             'regressionTestName': regression_test_name(identity_hash),
                             'workspaces': {'release': '/workspace/release', 'target': '/workspace/target',
                                            'scratch': '/workspace/scratch'},
@@ -351,6 +363,7 @@ def run_job(github: Any, config: dict[str, Any], job: dict[str, Any]) -> dict[st
                     published = publish_investigated_fix(
                         github, alert=context.alert, evidence=job['evidence'], decision=decision,
                         issue_number=context.issue_number, base_branch=target, base_sha=base,
+                        branch_base_sha=branch_base,
                         release_sha=release, bot_login=config['botLogin'], verification=verification,
                         prior_bot_logins=config.get('priorBotLogins', ()),
                     )

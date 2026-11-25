@@ -97,14 +97,22 @@ def branch_head_sha(github: Any, base_branch: str) -> str:
 
 
 def _expected_manifest(
-    *, issue_id: str, identity_hash: str, source_sha: str, source_path: str,
-) -> dict[str, str]:
+    *,
+    issue_id: str,
+    issue_number: int,
+    identity_hash: str,
+    source_sha: str,
+    source_path: str,
+    branch_base_sha: str,
+) -> dict[str, Any]:
     """Manifest fields a published branch is pinned to."""
     return {
         'issueId': issue_id,
+        'issueNumber': issue_number,
         'identityHash': identity_hash,
         'sourceSha': source_sha,
         'sourcePath': source_path,
+        'branchBaseSha': branch_base_sha,
     }
 
 
@@ -159,11 +167,11 @@ def _pinned_pull_matches(
 
 
 def find_target_pull_request(
-    github: Any, identity_hash: str, base_branch: str,
+    github: Any, identity_hash: str, base_branch: str, issue_number: int,
 ) -> dict[str, Any] | None:
-    """The pull request published for this identity and target, open or already merged."""
+    """The current-format PR for this release identity, issue and target."""
     target = require_target_branch(base_branch)
-    return _find_pull_request(github, branch_name_for(identity_hash, target), target)
+    return _find_pull_request(github, branch_name_for(identity_hash, target, issue_number), target)
 
 
 def _pull_merged(pull: Mapping[str, Any]) -> bool:
@@ -193,7 +201,8 @@ def _verify_published_branch(
     parents = commit.get('parents') if isinstance(commit, dict) else None
     parent = parents[0].get('sha') if isinstance(parents, list) and parents \
         and isinstance(parents[0], dict) else None
-    if parent != manifest['baseSha']:
+    branch_base_sha = manifest.get('branchBaseSha', manifest['baseSha'])
+    if parent != branch_base_sha:
         return None, '브랜치 커밋의 부모가 manifest 기준 커밋과 다릅니다.'
     for file in manifest['files']:
         content = read_repository_file(github, head_sha, file['path'])
@@ -268,6 +277,7 @@ def _pull_request_body(
 
 * Crashlytics 이슈: `{manifest['issueId']}`
 * 대상 브랜치: `{base_branch}` @ `{manifest['baseSha']}`
+* 변경 기준: production @ `{manifest.get('branchBaseSha', manifest['baseSha'])}`
 * 발생 릴리스 소스: `{manifest['sourceSha']}` (`{safe_text(manifest['sourcePath'], 300)}`)
 * manifest: `{manifest_path_for(identity_hash)}`
 * manifestDigest: `{manifest_digest(manifest)}`
@@ -337,7 +347,9 @@ def _create_pull_request(
 ) -> PublishedFix | ManualReview:
     target = require_target_branch(base_branch)
     identity_hash = manifest['identityHash']
-    branch = branch_name_for(identity_hash, target)
+    if manifest.get('issueNumber') != issue_number:
+        return ManualReview('manifest의 이슈 번호가 PR 대상과 일치하지 않습니다.')
+    branch = branch_name_for(identity_hash, target, issue_number)
     try:
         pull: Any = github.rest(
             'POST',
@@ -383,25 +395,28 @@ def resume_fix_pull_request(
     identity_hash: str,
     source_sha: str,
     source_path: str,
+    branch_base_sha: str,
     title: str,
     issue_number: int,
     base_branch: str,
     bot_login: str | None,
 ) -> PublishedFix | ManualReview:
-    """Resume a branch that already exists instead of generating (and charging) again."""
+    """Resume a current-format branch pinned to the same issue and release."""
     target = require_target_branch(base_branch)
     expected = _expected_manifest(
         issue_id=issue_id,
+        issue_number=issue_number,
         identity_hash=identity_hash,
         source_sha=source_sha,
         source_path=source_path,
+        branch_base_sha=branch_base_sha,
     )
     manifest, failure = _verify_published_branch(github, head_sha, expected)
     if manifest is None:
         return ManualReview(
             f'기존 자동 수정 브랜치의 manifest가 신뢰 기록과 일치하지 않습니다: {failure}'[:1000],
         )
-    branch = branch_name_for(identity_hash, target)
+    branch = branch_name_for(identity_hash, target, issue_number)
     pull = _find_pull_request(github, branch, target, head_sha=head_sha)
     if pull is not None:
         mismatch = _pinned_pull_matches(
@@ -439,16 +454,24 @@ def publish_fix_pull_request(
     """Commit the validated changes plus manifest, then open the fix pull request."""
     manifest = plan.manifest
     base_branch = require_target_branch(plan.base_branch)
+    validation = validate_manifest(manifest, {
+        'issueNumber': plan.issue_number,
+        'baseSha': manifest.get('baseSha'),
+        'branchBaseSha': plan.branch_base_sha,
+    })
+    if not validation['valid'] or manifest.get('issueNumber') != plan.issue_number \
+            or manifest.get('branchBaseSha') != plan.branch_base_sha:
+        return ManualReview('수정 manifest가 PR 대상 또는 production 기준과 일치하지 않습니다.')
     identity_hash = manifest['identityHash']
-    base_sha = manifest['baseSha']
+    branch_base_sha = manifest['branchBaseSha']
     changes = [
         *plan.changes,
         FileChange(manifest_path_for(identity_hash), manifest_bytes(manifest)),
     ]
-    tree_sha = _create_tree(github, base_sha, changes)
-    commit_sha = _create_commit(github, manifest, base_sha, tree_sha)
+    tree_sha = _create_tree(github, branch_base_sha, changes)
+    commit_sha = _create_commit(github, manifest, branch_base_sha, tree_sha)
 
-    branch = branch_name_for(identity_hash, base_branch)
+    branch = branch_name_for(identity_hash, base_branch, plan.issue_number)
     try:
         github.rest(
             'POST', f'{REPOSITORY_PATH}/git/refs', {'ref': f'refs/heads/{branch}', 'sha': commit_sha},
@@ -464,6 +487,7 @@ def publish_fix_pull_request(
             identity_hash=identity_hash,
             source_sha=manifest['sourceSha'],
             source_path=manifest['sourcePath'],
+            branch_base_sha=branch_base_sha,
             title=plan.title,
             issue_number=plan.issue_number,
             base_branch=base_branch,

@@ -53,6 +53,9 @@ query AccountType($login: String!) {
 }"""
 
 _FIX_BRANCH = re.compile(r"fix/crashlytics-([0-9a-f]{64})")
+_ISSUE_FIX_BRANCH = re.compile(
+    rf"fix/([1-9][0-9]*)-crashlytics-({'|'.join(map(re.escape, TARGET_BRANCHES))})-([0-9a-f]{{64}})"
+)
 _HOTFIX_BRANCH = re.compile(
     rf"hotfix/({'|'.join(map(re.escape, TARGET_BRANCHES))})/crashlytics-([0-9a-f]{{64}})"
 )
@@ -98,7 +101,9 @@ def find_ai_fix_for_line(
         identity_hash = _fix_branch_identity(head, base)
         if identity_hash is None or not _merge_commit_matches(pull.get("mergeCommit"), source.change_sha):
             continue
-        if not _manifest_lists_crashed_file(github, source.change_sha, identity_hash, source.path):
+        if not _manifest_lists_crashed_file(
+            github, source.change_sha, identity_hash, source.path, head,
+        ):
             continue
         return MergedAiFix(pull_number=number, commit_sha=source.change_sha)
     return None
@@ -129,12 +134,10 @@ def _is_bot_author(author: object, app_logins: set[str]) -> bool:
 
 
 def _fix_branch_identity(head_ref: str, base_ref: object) -> str | None:
-    """Identity hash of an automation fix branch at either naming generation.
-
-    ``hotfix/<target>/crashlytics-<hash>`` is the current scheme and must target
-    the branch it names. ``fix/crashlytics-<hash>`` is historical: old merged
-    pull requests still prove AI origin, but nothing new is written to them.
-    """
+    """Identity hash of a current or historical automation fix branch."""
+    current = _ISSUE_FIX_BRANCH.fullmatch(head_ref)
+    if current is not None:
+        return current.group(3) if base_ref == current.group(2) else None
     hotfix = _HOTFIX_BRANCH.fullmatch(head_ref)
     if hotfix is not None:
         return hotfix.group(2) if base_ref == hotfix.group(1) else None
@@ -161,12 +164,17 @@ def _manifest_lists_crashed_file(
     revision: str,
     identity_hash: str,
     source_path: str,
+    head_ref: str,
 ) -> bool:
     """Validate the manifest committed at the blamed AI revision."""
     manifest = _manifest_at(github, revision, identity_hash)
-    # A later release still blames the same AI commit, so the manifest
-    # release SHA may differ; the branch hash, file, and kind must not.
     if manifest is None or not validate_manifest(manifest, {"identityHash": identity_hash})["valid"]:
+        return False
+    current = _ISSUE_FIX_BRANCH.fullmatch(head_ref)
+    if current is not None:
+        if manifest.get("version") != 3 or int(current.group(1)) != manifest.get("issueNumber"):
+            return False
+    elif manifest.get("version") == 3:
         return False
     files = manifest.get("files")
     return isinstance(files, list) and any(

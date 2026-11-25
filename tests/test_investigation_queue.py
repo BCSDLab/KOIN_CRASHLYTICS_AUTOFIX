@@ -7,12 +7,11 @@ from urllib.parse import parse_qs
 import pytest
 
 from crashlytics_automation.investigation_jobs import (
-    STATE_BRANCH,
     InvestigationQueue,
     JobConflict,
     new_job,
 )
-from crashlytics_automation.repository import REPOSITORY_PATH
+from crashlytics_automation.repository import REPOSITORY_PATH, STATE_REPOSITORY_PATH, STATE_REFERENCE
 from crashlytics_automation.service import CrashAutomation
 
 
@@ -110,32 +109,32 @@ class MemoryGitHub:
                 self.issues[number].update(copy.deepcopy(body))
                 return copy.deepcopy(self.issues[number])
 
-        ref_path = f"{REPOSITORY_PATH}/git/ref/heads/{STATE_BRANCH}"
+        ref_path = f"{STATE_REPOSITORY_PATH}/git/ref/{STATE_REFERENCE.removeprefix('refs/')}"
         if path == ref_path and method == "GET":
-            if STATE_BRANCH not in self.refs:
+            if STATE_REFERENCE not in self.refs:
                 raise ApiError(404)
-            return {"object": {"sha": self.refs[STATE_BRANCH]}}
-        if path == f"{REPOSITORY_PATH}/git/refs" and method == "POST":
-            ref = body["ref"].removeprefix("refs/heads/")
+            return {"object": {"sha": self.refs[STATE_REFERENCE]}}
+        if path == f"{STATE_REPOSITORY_PATH}/git/refs" and method == "POST":
+            ref = body["ref"]
             if ref in self.refs:
                 raise ApiError(422)
             self.refs[ref] = body["sha"]
             return {"ref": body["ref"]}
-        if path == f"{REPOSITORY_PATH}/git/refs/heads/{STATE_BRANCH}" and method == "PATCH":
+        if path == f"{STATE_REPOSITORY_PATH}/git/refs/{STATE_REFERENCE.removeprefix('refs/')}" and method == "PATCH":
             commit = self.commits[body["sha"]]
-            if commit["parents"] != [self.refs.get(STATE_BRANCH)]:
+            if commit["parents"] != [self.refs.get(STATE_REFERENCE)]:
                 raise ApiError(409)
-            self.refs[STATE_BRANCH] = body["sha"]
+            self.refs[STATE_REFERENCE] = body["sha"]
             return {"object": {"sha": body["sha"]}}
-        if path == f"{REPOSITORY_PATH}/git/blobs" and method == "POST":
+        if path == f"{STATE_REPOSITORY_PATH}/git/blobs" and method == "POST":
             raw = base64.b64decode(body["content"])
             sha = self._sha(raw)
             self.blobs[sha] = raw
             return {"sha": sha}
-        if path.startswith(f"{REPOSITORY_PATH}/git/blobs/") and method == "GET":
+        if path.startswith(f"{STATE_REPOSITORY_PATH}/git/blobs/") and method == "GET":
             sha = path.rsplit("/", 1)[1]
             return {"encoding": "base64", "content": base64.b64encode(self.blobs[sha]).decode()}
-        if path.startswith(f"{REPOSITORY_PATH}/git/trees/") and method == "GET":
+        if path.startswith(f"{STATE_REPOSITORY_PATH}/git/trees/") and method == "GET":
             sha = path.split("/git/trees/", 1)[1].split("?", 1)[0]
             commit = self.commits.get(sha)
             tree_sha = commit["tree"] if commit else sha
@@ -144,7 +143,7 @@ class MemoryGitHub:
                 {"path": name, "type": "blob", "sha": blob}
                 for name, blob in sorted(tree.items())
             ]}
-        if path == f"{REPOSITORY_PATH}/git/trees" and method == "POST":
+        if path == f"{STATE_REPOSITORY_PATH}/git/trees" and method == "POST":
             tree = copy.deepcopy(self.trees.get(body.get("base_tree"), {}))
             for item in body["tree"]:
                 if item["sha"] is None:
@@ -154,9 +153,9 @@ class MemoryGitHub:
             sha = self._sha(repr(sorted(tree.items())))
             self.trees[sha] = tree
             return {"sha": sha}
-        if path.startswith(f"{REPOSITORY_PATH}/git/commits/") and method == "GET":
+        if path.startswith(f"{STATE_REPOSITORY_PATH}/git/commits/") and method == "GET":
             return {"tree": {"sha": self.commits[path.rsplit("/", 1)[1]]["tree"]}}
-        if path == f"{REPOSITORY_PATH}/git/commits" and method == "POST":
+        if path == f"{STATE_REPOSITORY_PATH}/git/commits" and method == "POST":
             parents = body["parents"]
             raw = repr((body["tree"], parents, body["message"]))
             sha = self._sha(raw)
@@ -211,6 +210,7 @@ def test_library_only_evidence_is_enqueued_once_and_reused_without_bigquery():
     assert job["status"] == "queued"
     assert job["evidence"]["frame"] is None
     assert job["evidence"]["stackTrace"]["exceptions"][0]["type"] == "java.lang.OutOfMemoryError"
+    assert github.refs and not any(ref.startswith("refs/heads/") for ref in github.refs)
 
 
 def service_context_alert():

@@ -19,7 +19,7 @@ from typing import Any
 
 import jwt
 
-from .repository import OWNER, REPO, REPOSITORY_PATH
+from .repository import OWNER, REPO, REPOSITORY_PATH, STATE_REPO, STATE_REPOSITORY_PATH, STATE_REFERENCE
 
 API_ROOT = "https://api.github.com"
 GRAPHQL_PATH = "/graphql"
@@ -42,16 +42,19 @@ class GitHub:
         self,
         token: str,
         session: Any,
+        *,
+        include_state: bool = False,
     ) -> None:
         self._token = token
         self._session = session
+        self._include_state = include_state
 
     def rest(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
         # API destinations are application-owned, never copied from crash reports.
-        if path not in (GRAPHQL_PATH, REPOSITORY_PATH) and not path.startswith(f"{REPOSITORY_PATH}/") and not path.startswith(
-            "/search/issues?"
-        ):
-            raise ValueError("GitHub endpoint outside the configured repository")
+        application = path in (GRAPHQL_PATH, REPOSITORY_PATH) or path.startswith(f"{REPOSITORY_PATH}/") or path.startswith("/search/issues?")
+        state = self._include_state and self._state_endpoint(method, path, body)
+        if not application and not state:
+            raise ValueError("GitHub endpoint outside the configured repository scope")
         headers = {
             "Authorization": f"Bearer {self._token}",
             "Accept": "application/vnd.github+json",
@@ -71,6 +74,24 @@ class GitHub:
         if response.status_code == 204:
             return None
         return response.json()
+
+    @staticmethod
+    def _state_endpoint(method: str, path: str, body: dict[str, Any] | None) -> bool:
+        ref = STATE_REFERENCE.removeprefix('refs/')
+        if method == 'GET':
+            return path in (STATE_REPOSITORY_PATH, f'{STATE_REPOSITORY_PATH}/git/ref/{ref}') or any(
+                path.startswith(f'{STATE_REPOSITORY_PATH}/git/{kind}/') for kind in ('blobs', 'trees', 'commits')
+            )
+        if method == 'POST':
+            return path in (f'{STATE_REPOSITORY_PATH}/git/blobs', f'{STATE_REPOSITORY_PATH}/git/trees',
+                            f'{STATE_REPOSITORY_PATH}/git/commits') or (
+                path == f'{STATE_REPOSITORY_PATH}/git/refs' and isinstance(body, dict)
+                and body.get('ref') == STATE_REFERENCE
+            )
+        return (
+            method == 'PATCH' and path == f'{STATE_REPOSITORY_PATH}/git/refs/{ref}'
+            and isinstance(body, dict) and body.get('force', False) is False
+        )
 
     def graphql(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
         result = self.rest("POST", GRAPHQL_PATH, {"query": query, "variables": variables})
@@ -127,6 +148,7 @@ def create_github(
     *,
     permissions: dict[str, str] | None = None,
     session: Any = None,
+    include_state: bool = False,
 ) -> GitHub:
     """Mint a repository-scoped installation token and return the API client.
 
@@ -146,7 +168,8 @@ def create_github(
     now = int(time.time())
     app_token = jwt.encode({"iat": now - 60, "exp": now + 600, "iss": app_id_text},
                            private_key, algorithm="RS256")
-    token_body: dict[str, Any] = {"repositories": [REPO]}
+    repositories = [REPO, STATE_REPO] if include_state else [REPO]
+    token_body: dict[str, Any] = {"repositories": repositories}
     if permissions is not None:
         token_body["permissions"] = permissions
     response = session.request(
@@ -168,7 +191,7 @@ def create_github(
     token = payload.get("token") if isinstance(payload, dict) else None
     if not isinstance(token, str) or not token:
         raise RuntimeError("GitHub installation token unavailable")
-    return GitHub(token, session)
+    return GitHub(token, session, include_state=include_state)
 
 
 def _issue_number(value: object) -> int:

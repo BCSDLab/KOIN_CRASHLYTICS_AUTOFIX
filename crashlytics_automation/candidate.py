@@ -1,8 +1,8 @@
 """Candidate policy for Crashlytics autofix.
 
-Ties every model-supplied file to exact bytes of the pinned target base branch
-and to a deterministic manifest. This module has no network, filesystem, shell,
-or credential access; it is pure stdlib.
+Ties every model-supplied file to exact bytes of the pinned branch base and to a
+deterministic manifest. This module has no network, filesystem, shell, or
+credential access; it is pure stdlib.
 """
 
 from __future__ import annotations
@@ -17,8 +17,8 @@ from .repository import REPOSITORY, TARGET_BRANCHES
 MAX_CANDIDATE_FILES = 24
 MAX_FILE_BYTES = 256 * 1024
 MAX_TOTAL_BYTES = 1024 * 1024
-MANIFEST_VERSION = 2
-LEGACY_MANIFEST_VERSION = 1
+MANIFEST_VERSION = 3
+LEGACY_MANIFEST_VERSIONS = (1, 2)
 
 SHA40 = re.compile(r'[0-9a-f]{40}')
 SHA64 = re.compile(r'[0-9a-f]{64}')
@@ -34,6 +34,7 @@ MANIFEST_KEYS = (
     'version', 'issueId', 'identityHash',
     'baseSha', 'sourceSha', 'sourcePath', 'files',
 )
+MANIFEST_KEYS_V3 = (*MANIFEST_KEYS, 'issueNumber', 'branchBaseSha')
 FILE_KEYS = ('path', 'kind', 'beforeSha256', 'afterSha256')
 
 # Collation order used by the published JS artifacts: primary weights ignore
@@ -85,9 +86,12 @@ def require_target_branch(base_branch: Any) -> str:
     return base_branch
 
 
-def branch_name_for(identity_hash: Any, base_branch: Any) -> str:
+def branch_name_for(identity_hash: Any, base_branch: Any, issue_number: Any) -> str:
     target = require_target_branch(base_branch)
-    return f'hotfix/{target}/crashlytics-{_require_identity_hash(identity_hash)}'
+    _require_identity_hash(identity_hash)
+    if type(issue_number) is not int or not 0 < issue_number <= 2**53 - 1:
+        raise TypeError('Invalid issue number')
+    return f'fix/{issue_number}-crashlytics-{target}-{identity_hash}'
 
 
 def manifest_path_for(identity_hash: Any) -> str:
@@ -241,16 +245,22 @@ def validate_candidate(
 def candidate_manifest(
     *,
     issue_id: Any,
+    issue_number: Any,
     identity_hash: Any,
     base_sha: Any,
+    branch_base_sha: Any,
     source_sha: Any,
     source_path: Any,
     files: Any,
 ) -> dict[str, Any]:
+    if type(issue_number) is not int or not 0 < issue_number <= 2**53 - 1:
+        raise TypeError('Invalid issue number')
     if not isinstance(issue_id, str) or not ISSUE_ID.fullmatch(issue_id):
         raise TypeError('Invalid issue ID')
     if not isinstance(base_sha, str) or not SHA40.fullmatch(base_sha):
         raise TypeError('Invalid base SHA')
+    if not isinstance(branch_base_sha, str) or not SHA40.fullmatch(branch_base_sha):
+        raise TypeError('Invalid branch base SHA')
     if not isinstance(source_sha, str) or not SHA40.fullmatch(source_sha):
         raise TypeError('Invalid source SHA')
     if identity_hash_for(issue_id, source_sha) != identity_hash:
@@ -289,7 +299,9 @@ def candidate_manifest(
         'version': MANIFEST_VERSION,
         'issueId': issue_id,
         'identityHash': identity_hash,
+        'issueNumber': issue_number,
         'baseSha': base_sha,
+        'branchBaseSha': branch_base_sha,
         'sourceSha': source_sha,
         'sourcePath': source_path,
         'files': entries,
@@ -316,10 +328,11 @@ def validate_manifest(manifest: Any, expected: Mapping[str, Any] | None = None) 
     sourcePath. Byte sizes and on-branch content can only be checked by the caller.
     """
     expected = expected or {}
-    if not _has_exact_keys(manifest, MANIFEST_KEYS):
+    version = manifest.get('version') if isinstance(manifest, dict) else None
+    keys = MANIFEST_KEYS_V3 if version == MANIFEST_VERSION else MANIFEST_KEYS
+    if not _has_exact_keys(manifest, keys):
         return {'valid': False, 'reason': 'manifest 형식이 올바르지 않습니다.'}
-    version = manifest['version']
-    if type(version) is not int or version not in (LEGACY_MANIFEST_VERSION, MANIFEST_VERSION):
+    if type(version) is not int or version not in (*LEGACY_MANIFEST_VERSIONS, MANIFEST_VERSION):
         return {'valid': False, 'reason': '지원하지 않는 manifest 버전입니다.'}
     issue_id = manifest['issueId']
     if not isinstance(issue_id, str) or not ISSUE_ID.fullmatch(issue_id):
@@ -331,19 +344,34 @@ def validate_manifest(manifest: Any, expected: Mapping[str, Any] | None = None) 
         or not isinstance(source_sha, str) or not SHA40.fullmatch(source_sha)
     ):
         return {'valid': False, 'reason': 'manifest의 SHA 값이 올바르지 않습니다.'}
+    if version == MANIFEST_VERSION and (
+        not isinstance(manifest['branchBaseSha'], str)
+        or not SHA40.fullmatch(manifest['branchBaseSha'])
+    ):
+        return {'valid': False, 'reason': 'manifest의 branchBaseSha가 올바르지 않습니다.'}
     identity_hash = manifest['identityHash']
-    expected_identity = _legacy_identity_hash_for(issue_id) if version == LEGACY_MANIFEST_VERSION \
+    expected_identity = _legacy_identity_hash_for(issue_id) if version == 1 \
         else identity_hash_for(issue_id, source_sha)
     if (
         not isinstance(identity_hash, str) or not SHA64.fullmatch(identity_hash)
         or expected_identity != identity_hash
     ):
         return {'valid': False, 'reason': 'manifest의 identityHash가 일치하지 않습니다.'}
-    if not is_allowed_source_path(manifest['sourcePath']):
-        return {'valid': False, 'reason': 'manifest의 sourcePath가 허용되지 않습니다.'}
+    if version == MANIFEST_VERSION:
+        issue_number = manifest['issueNumber']
+        if type(issue_number) is not int or not 0 < issue_number <= 2**53 - 1:
+            return {'valid': False, 'reason': 'manifest의 issueNumber가 올바르지 않습니다.'}
     for key in ('issueId', 'identityHash', 'baseSha', 'sourceSha', 'sourcePath'):
         if key in expected and expected[key] != manifest[key]:
             return {'valid': False, 'reason': f'manifest의 {key} 값이 예상과 다릅니다.'}
+    if version == MANIFEST_VERSION and 'issueNumber' in expected \
+            and expected['issueNumber'] != manifest['issueNumber']:
+        return {'valid': False, 'reason': 'manifest의 issueNumber 값이 예상과 다릅니다.'}
+    if version == MANIFEST_VERSION and 'branchBaseSha' in expected \
+            and expected['branchBaseSha'] != manifest['branchBaseSha']:
+        return {'valid': False, 'reason': 'manifest의 branchBaseSha 값이 예상과 다릅니다.'}
+    if not is_allowed_source_path(manifest['sourcePath']):
+        return {'valid': False, 'reason': 'manifest의 sourcePath가 허용되지 않습니다.'}
     files = manifest['files']
     if not isinstance(files, list) or not files or len(files) > MAX_CANDIDATE_FILES:
         return {'valid': False, 'reason': 'manifest의 파일 목록이 올바르지 않습니다.'}

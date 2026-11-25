@@ -113,6 +113,7 @@ class FixPlan:
     title: str
     issue_number: int
     base_branch: str
+    branch_base_sha: str
 
 
 @dataclass

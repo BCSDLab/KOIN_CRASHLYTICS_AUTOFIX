@@ -23,7 +23,12 @@ from .repository import TARGET_BRANCHES
 from .task_payloads import validate_merge_task
 
 PEER_BRANCH = {'production': 'develop', 'develop': 'production'}
-HOTFIX_BRANCH = re.compile(rf'hotfix/({"|".join(map(re.escape, TARGET_BRANCHES))})/crashlytics-([0-9a-f]{{64}})')
+LEGACY_HOTFIX_BRANCH = re.compile(
+    rf'hotfix/({"|".join(map(re.escape, TARGET_BRANCHES))})/crashlytics-([0-9a-f]{{64}})'
+)
+FIX_BRANCH = re.compile(
+    rf'fix/([1-9][0-9]*)-crashlytics-({"|".join(map(re.escape, TARGET_BRANCHES))})-([0-9a-f]{{64}})'
+)
 REQUIRED_CHECKS = ('Lint & Format Check', 'Code Coverage')
 FAILED_CONCLUSIONS = {'failure', 'timed_out', 'cancelled', 'action_required', 'startup_failure'}
 
@@ -99,21 +104,23 @@ def _verify_changes(github: Any, pr: dict[str, Any], manifest: dict[str, Any], p
         return _blocked('manifest must be newly added on the pull request')
     total_bytes = 0
     for entry in manifest['files']:
-        expected_status = 'added' if entry['beforeSha256'] is None else 'modified'
-        if by_name[entry['path']]['status'] != expected_status:
-            return _blocked('candidate file change status does not match the manifest')
         head = _read_file(github, entry['path'], job['headSha'])
         if head.get('missing') or head.get('invalid') or head['size'] > MAX_FILE_BYTES:
             return _blocked('candidate file is missing, unsupported or too large')
         total_bytes += head['size']
         if total_bytes > MAX_TOTAL_BYTES or sha256(head['bytes']) != entry['afterSha256']:
             return _blocked('candidate content does not match the manifest')
-        base = _read_file(github, entry['path'], job['baseSha'])
+        branch_base_sha = manifest.get('branchBaseSha', manifest['baseSha'])
+        base = _read_file(github, entry['path'], branch_base_sha)
         if entry['beforeSha256'] is None:
             if not base.get('missing'):
-                return _blocked('new candidate file already exists on the base commit')
+                return _blocked('new candidate file already exists on the production branch base')
+            if entry['kind'] == 'test' and not _read_file(
+                github, entry['path'], job['baseSha'],
+            ).get('missing'):
+                return _blocked('new regression test already exists on the PR target base')
         elif base.get('missing') or base.get('invalid') or sha256(base['bytes']) != entry['beforeSha256']:
-            return _blocked('candidate base content does not match the manifest')
+            return _blocked('candidate production baseline does not match the manifest')
     return None
 
 
@@ -153,16 +160,33 @@ def _fixed_repository(pr: dict[str, Any]) -> bool:
     return all((pr.get(side) or {}).get('repo', {}).get('full_name') == f'{OWNER}/{REPO}' for side in ('head', 'base'))
 
 
-def _hotfix_identity(pr: dict[str, Any], target: str, bot_login: str) -> str | None:
-    """The identity hash pinned by this exact automation hotfix branch."""
+def _hotfix_identity(
+    pr: dict[str, Any], target: str, bot_login: str, issue_number: int,
+) -> str | None:
+    """Identify a current issue-scoped branch or a historical queued hotfix ref."""
     head = pr.get('head') if isinstance(pr.get('head'), dict) else {}
     branch = head.get('ref')
-    match = HOTFIX_BRANCH.fullmatch(branch) if isinstance(branch, str) else None
-    if match is None or match[1] != target or branch != branch_name_for(match[2], target):
+    if (pr.get('user') or {}).get('login') != bot_login or not isinstance(branch, str):
         return None
-    if (pr.get('user') or {}).get('login') != bot_login:
-        return None
-    return match[2]
+    current = FIX_BRANCH.fullmatch(branch)
+    if current is not None:
+        number = int(current[1])
+        identity_hash, branch_target = current[3], current[2]
+        if number != issue_number or branch_target != target \
+                or branch != branch_name_for(identity_hash, target, number):
+            return None
+        return identity_hash
+    legacy = LEGACY_HOTFIX_BRANCH.fullmatch(branch)
+    if legacy is not None and legacy[1] == target:
+        return legacy[2]
+    return None
+
+
+def _is_current_issue_branch(pr: dict[str, Any], target: str, issue_number: int) -> bool:
+    head = pr.get('head') if isinstance(pr.get('head'), dict) else {}
+    branch = head.get('ref')
+    match = FIX_BRANCH.fullmatch(branch) if isinstance(branch, str) else None
+    return match is not None and int(match[1]) == issue_number and match[2] == target
 
 
 def _verify_peer_pull(
@@ -183,7 +207,7 @@ def _verify_peer_pull(
         return False, _blocked('peer pull request targets an unexpected branch')
     if (peer.get('head') or {}).get('sha') != head_sha:
         return False, _blocked('peer pull request head moved after the merge was scheduled')
-    if _hotfix_identity(peer, peer_target, bot_login) != identity_hash:
+    if _hotfix_identity(peer, peer_target, bot_login, job['issueNumber']) != identity_hash:
         return False, _blocked('peer pull request is not the automation hotfix for this issue')
     if not _closes_tracked_issue(peer, job):
         return False, _blocked('peer pull request does not close exactly the tracked issue')
@@ -213,7 +237,7 @@ def attempt_merge(github: Any, job: dict[str, Any], *, bot_login: str) -> dict[s
         return _blocked('pull request is not against the configured repository')
     if not _closes_tracked_issue(pr, job):
         return _blocked('pull request does not close exactly the tracked issue')
-    identity_hash = _hotfix_identity(pr, target, bot_login)
+    identity_hash = _hotfix_identity(pr, target, bot_login, job['issueNumber'])
     if identity_hash is None:
         return _blocked('pull request branch or author is not the automation identity')
     peer_merged, peer_error = _verify_peer_pull(github, job, pins, peer_target, identity_hash, bot_login)
@@ -245,12 +269,26 @@ def attempt_merge(github: Any, job: dict[str, Any], *, bot_login: str) -> dict[s
         digest = manifest_digest(manifest)
     except (ValueError, TypeError, UnicodeError):
         return _blocked('candidate manifest is not valid JSON')
-    if digest != job['manifestDigest']:
-        return _blocked('candidate manifest digest does not match the trusted record')
-    if not validate_manifest(manifest, {
-        'issueId': job['alert']['issueId'], 'identityHash': identity_hash, 'baseSha': job['baseSha'],
-    })['valid']:
+    is_current_branch = _is_current_issue_branch(pr, target, job['issueNumber'])
+    if is_current_branch != (manifest.get('version') == 3):
+        return _blocked('pull request branch and manifest versions do not match')
+    expected_manifest = {
+        'issueId': job['alert']['issueId'],
+        'identityHash': identity_hash,
+        'baseSha': job['baseSha'],
+    }
+    if manifest.get('version') == 3:
+        expected_manifest['issueNumber'] = job['issueNumber']
+    if not validate_manifest(manifest, expected_manifest)['valid']:
         return _blocked('candidate manifest is invalid')
+    branch_base_sha = manifest.get('branchBaseSha', manifest['baseSha'])
+    commit = github.rest('GET', f"{REPOSITORY_PATH}/commits/{job['headSha']}")
+    parents = commit.get('parents') if isinstance(commit, dict) else None
+    if (
+        not isinstance(parents, list) or len(parents) != 1
+        or not isinstance(parents[0], dict) or parents[0].get('sha') != branch_base_sha
+    ):
+        return _blocked('candidate commit does not originate from its pinned branch base')
     for problem in (
         lambda: _verify_changes(github, pr, manifest, path, job),
         lambda: _verify_checks(github, job['headSha']),
@@ -261,7 +299,9 @@ def attempt_merge(github: Any, job: dict[str, Any], *, bot_login: str) -> dict[s
     current = github.rest('GET', f"{REPOSITORY_PATH}/pulls/{job['pullNumber']}")
     if not _fixed_repository(current) or current.get('state') != 'open' or current.get('draft') or current.get('merged') or current['base'].get('ref') != target:
         return _blocked('pull request changed target or state before merge')
-    if current['head'].get('sha') != job['headSha'] or _hotfix_identity(current, target, bot_login) != identity_hash:
+    if current['head'].get('sha') != job['headSha'] or _hotfix_identity(
+        current, target, bot_login, job['issueNumber'],
+    ) != identity_hash:
         return _blocked('pull request identity moved before merge')
     if not _closes_tracked_issue(current, job):
         return _blocked('pull request issue association changed before merge')

@@ -36,11 +36,30 @@ jobs:
 
       - name: Verify investigation regressions
         run: |
-          docker run --rm --network none -v "$PWD/.github/workflows:/workflows:ro" \
-            -w /workflows rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 \
-            -shellcheck= -pyflakes= deploy.yml investigate.yml
+          docker run --rm --network none -v "$PWD/.github/workflows:/work/.github/workflows:ro" \
+            -w /work rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 \
+            -shellcheck= -pyflakes= .github/workflows/*.yml
           venv/bin/pip install --disable-pip-version-check --require-hashes -r requirements-test.txt
           venv/bin/python -m pytest -q tests
+
+      - name: Verify existing state repository access
+        env:
+          CRASHLYTICS_ENV: ${{ secrets.CRASHLYTICS_ENV }}
+          CRASHLYTICS_GITHUB_APP_PRIVATE_KEY: ${{ secrets.CRASHLYTICS_GITHUB_APP_PRIVATE_KEY }}
+        run: |
+          venv/bin/python - <<'PY'
+          from crashlytics_automation.worker import runtime_config, worker_github
+          runtime_config()
+          from crashlytics_automation.github import GitHubError
+          from crashlytics_automation.repository import STATE_REPOSITORY_PATH, STATE_REFERENCE
+          github = worker_github()
+          try:
+              github.rest('GET', STATE_REPOSITORY_PATH + '/git/ref/' + STATE_REFERENCE.removeprefix('refs/'))
+          except GitHubError as error:
+              if error.status != 404:
+                  raise
+          print('Existing application and metadata repository access verified')
+          PY
 
       - name: Write runtime configuration
         env:
