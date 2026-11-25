@@ -14,6 +14,7 @@ import requests
 from .candidate import MAX_CANDIDATE_FILES, MAX_FILE_BYTES, canonical_json
 
 RESPONSES_URL = 'https://api.openai.com/v1/responses'
+INPUT_TOKENS_URL = 'https://api.openai.com/v1/responses/input_tokens'
 REQUEST_TIMEOUT_SECONDS = 180
 MAX_OUTPUT_TOKENS = 32_000
 MAX_REASON_LENGTH = 4000
@@ -186,14 +187,12 @@ def _normalize_decision(parsed: Any) -> dict[str, Any]:
     }
 
 
-def _response(
-    http: Any,
-    api_key: str,
+def _request_payload(
     model: str,
     request_input: list[dict[str, Any]],
-    max_tokens: int,
-    timeout_seconds: float,
     tool_choice: Any,
+    *,
+    max_tokens: int | None = None,
 ) -> dict[str, Any]:
     payload = {
         'model': model,
@@ -209,9 +208,23 @@ def _response(
                 'schema': RESPONSE_SCHEMA,
             },
         },
-        'max_output_tokens': max_tokens,
-        'store': False,
     }
+    if max_tokens is not None:
+        payload['max_output_tokens'] = max_tokens
+        payload['store'] = False
+    return payload
+
+
+def _response(
+    http: Any,
+    api_key: str,
+    model: str,
+    request_input: list[dict[str, Any]],
+    max_tokens: int,
+    timeout_seconds: float,
+    tool_choice: Any,
+) -> dict[str, Any]:
+    payload = _request_payload(model, request_input, tool_choice, max_tokens=max_tokens)
     try:
         data = canonical_json(payload).encode('utf-8')
     except UnicodeEncodeError as error:
@@ -253,6 +266,48 @@ def _response(
             code='failed_model_response',
         )
     return result
+
+
+def _count_input_tokens(
+    http: Any,
+    api_key: str,
+    model: str,
+    request_input: list[dict[str, Any]],
+    timeout_seconds: float,
+    tool_choice: Any,
+) -> int:
+    payload = _request_payload(model, request_input, tool_choice)
+    try:
+        data = canonical_json(payload).encode('utf-8')
+    except UnicodeEncodeError as error:
+        raise FixProposalResponseError(
+            'OpenAI input token count failed', code='input_token_count_failed',
+        ) from error
+    try:
+        response = http.post(
+            INPUT_TOKENS_URL,
+            data=data,
+            headers={'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'},
+            timeout=timeout_seconds,
+            allow_redirects=False,
+        )
+        if not 200 <= response.status_code < 300:
+            raise FixProposalResponseError(
+                'OpenAI input token count failed', code='input_token_count_failed',
+            )
+        result = response.json()
+    except FixProposalResponseError:
+        raise
+    except Exception as error:
+        raise FixProposalResponseError(
+            'OpenAI input token count failed', code='input_token_count_failed',
+        ) from error
+    count = result.get('input_tokens') if isinstance(result, dict) else None
+    if not isinstance(result, dict) or result.get('object') != 'response.input_tokens' or type(count) is not int or count < 0:
+        raise FixProposalResponseError(
+            'OpenAI input token count failed', code='input_token_count_failed',
+        )
+    return count
 
 
 def _tool_calls(body: dict[str, Any]) -> list[dict[str, Any]]:
@@ -416,10 +471,22 @@ def request_fix_proposal(
             raise FixProposalResponseError('Investigation output budget exceeded', code='investigation_output_limit')
         estimated_input_tokens = len(canonical_json(request_input).encode('utf-8'))
         estimated_input_tokens += len(canonical_json([RUN_COMMAND, RUN_EXPERIMENT, RESPONSE_SCHEMA]).encode('utf-8'))
-        if cumulative_input_tokens + estimated_input_tokens > MAX_CUMULATIVE_INPUT_TOKENS:
-            raise FixProposalResponseError(
-                'Investigation input budget exceeded', code='investigation_input_limit',
+        prospective_input_tokens = estimated_input_tokens
+        remaining_input_tokens = MAX_CUMULATIVE_INPUT_TOKENS - cumulative_input_tokens
+        if estimated_input_tokens > remaining_input_tokens:
+            prospective_input_tokens = _count_input_tokens(
+                http, api_key, model, request_input, min(REQUEST_TIMEOUT_SECONDS, remaining_time), tool_choice,
             )
+            if prospective_input_tokens > remaining_input_tokens:
+                raise FixProposalResponseError(
+                    'Investigation input budget exceeded', code='investigation_input_limit',
+                )
+        remaining_time = MAX_INVESTIGATION_SECONDS - (time.monotonic() - started)
+        if remaining_time <= 0:
+            raise FixProposalResponseError('Investigation time limit exceeded', code='investigation_timeout')
+        remaining_tokens = MAX_OUTPUT_TOKENS - output_tokens
+        if remaining_tokens <= 0:
+            raise FixProposalResponseError('Investigation output budget exceeded', code='investigation_output_limit')
         body = _response(
             http, api_key, model, request_input,
             min(MAX_OUTPUT_TOKENS, remaining_tokens),
@@ -431,7 +498,7 @@ def request_fix_proposal(
         cumulative_input_tokens += (
             reported_input_tokens
             if type(reported_input_tokens) is int and reported_input_tokens >= 0
-            else estimated_input_tokens
+            else prospective_input_tokens
         )
         if cumulative_input_tokens > MAX_CUMULATIVE_INPUT_TOKENS:
             raise FixProposalResponseError(

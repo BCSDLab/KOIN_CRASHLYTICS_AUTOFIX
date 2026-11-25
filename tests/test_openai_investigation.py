@@ -386,3 +386,85 @@ def test_provider_timeout_and_token_limit_are_reported_without_secret_echo():
         )
     assert error.value.code == 'incomplete_model_response'
     assert 'secret-key' not in str(error.value)
+
+
+def test_large_byte_input_uses_exact_count_and_can_complete_investigation(monkeypatch):
+    monkeypatch.setattr(openai_client, 'MAX_CUMULATIVE_INPUT_TOKENS', 1000)
+    proposal = {
+        'decision': 'fix',
+        'reason': 'A defect was identified.',
+        'analysis': 'Observed a reproducible defect.',
+        'sourcePath': 'src/Main.kt',
+        'sourceLine': 12,
+        'files': [{'path': 'src/Main.kt', 'content': 'class Main'}],
+    }
+
+    class Session:
+        def __init__(self):
+            self.generation_calls = 0
+            self.count_calls = 0
+
+        def post(self, url, *, data, **_kwargs):
+            if url == openai_client.INPUT_TOKENS_URL:
+                self.count_calls += 1
+                return FakeResponse({'object': 'response.input_tokens', 'input_tokens': 10})
+            self.generation_calls += 1
+            if self.generation_calls == 1:
+                body = tool_call()
+            else:
+                body = {
+                    'status': 'completed',
+                    'output_text': json.dumps(proposal),
+                    'usage': {'input_tokens': 10, 'output_tokens': 10},
+                    'output': [],
+                }
+            if self.generation_calls == 1:
+                body['usage'] = {'input_tokens': 10, 'output_tokens': 10}
+            return FakeResponse(body)
+
+    session = Session()
+    result = request_fix_proposal(
+        api_key='secret-key',
+        context={'evidence': 'large ' * 1000},
+        execute=lambda **_: {'exit_code': 0, 'stdout': 'ok', 'stderr': '', 'timed_out': False},
+        session=session,
+    )
+    assert result['decision'] == 'fix'
+    assert session.count_calls >= 1
+    assert session.generation_calls == 2
+
+
+@pytest.mark.parametrize('count_result,expected_code', [
+    ({'object': 'response.input_tokens', 'input_tokens': 1001}, 'investigation_input_limit'),
+    ({'object': 'response.input_tokens', 'input_tokens': True}, 'input_token_count_failed'),
+    ({'object': 'response.input_tokens', 'input_tokens': -1}, 'input_token_count_failed'),
+    ({'object': 'response', 'input_tokens': 10}, 'input_token_count_failed'),
+    (None, 'input_token_count_failed'),
+])
+def test_over_budget_or_malformed_exact_count_prevents_generation(monkeypatch, count_result, expected_code):
+    monkeypatch.setattr(openai_client, 'MAX_CUMULATIVE_INPUT_TOKENS', 1000)
+
+    class Session:
+        generation_calls = 0
+        count_calls = 0
+
+        def post(self, url, **_kwargs):
+            if url == openai_client.INPUT_TOKENS_URL:
+                self.count_calls += 1
+                if count_result is None:
+                    return type('FailedResponse', (), {'status_code': 503})()
+                return FakeResponse(count_result)
+            self.generation_calls += 1
+            return FakeResponse(final())
+
+    session = Session()
+    with pytest.raises(FixProposalResponseError) as error:
+        request_fix_proposal(
+            api_key='secret-key',
+            context={'evidence': 'large ' * 1000},
+            execute=lambda **_: None,
+            session=session,
+        )
+    assert session.count_calls == 1
+    assert session.generation_calls == 0
+    assert error.value.code == expected_code

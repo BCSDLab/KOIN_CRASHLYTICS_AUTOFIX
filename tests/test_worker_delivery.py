@@ -198,8 +198,8 @@ def test_failed_trusted_verification_reports_analysis_without_publishing(monkeyp
                 source_file.write_text(source_before, encoding='utf-8')
 
     class FailedVerificationSandbox:
-        def __init__(self, **_kwargs):
-            pass
+        def __init__(self, **kwargs):
+            self.artifact_directory = kwargs['target'].parent / 'artifacts'
 
         def __enter__(self):
             return self
@@ -249,6 +249,88 @@ def test_failed_trusted_verification_reports_analysis_without_publishing(monkeyp
     assert reports and reports[0][1] == 'Regression test passed before the fix.'
     assert reports[0][0].evidence['investigation']['analyses'][target]['analysis'] == decision['analysis']
     assert publications == []
+
+
+def test_interrupted_provider_failure_keeps_incremental_trace_and_retries_only_pending_report(monkeypatch, tmp_path):
+    from crashlytics_automation import issues
+    from crashlytics_automation.investigation_jobs import JobConflict
+
+    class ConflictingReportQueue(Queue):
+        conflict_on_clear = True
+
+        def put(self, job):
+            if self.conflict_on_clear and job.get('status') == 'manual' and not job.get('reportPending'):
+                self.conflict_on_clear = False
+                raise JobConflict('another writer updated report bookkeeping')
+            super().put(job)
+
+    class CheckedOutGithub(Github):
+        def checkout(self, _sha, destination):
+            destination.mkdir(parents=True, exist_ok=True)
+
+    class RecordingSandbox:
+        def __init__(self, **_kwargs):
+            self.artifact_directory = tmp_path / 'artifacts'
+            self.artifact_directory.mkdir(exist_ok=True)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, *, command, timeout_seconds):
+            assert command == 'printf trace'
+            assert timeout_seconds > 0
+            return {'exit_code': 0, 'stdout': 'callback output test-only sentinel-private-key', 'stderr': '', 'timed_out': False}
+
+    queue = ConflictingReportQueue()
+    _patch_queue(monkeypatch, queue)
+    reports = []
+    model_calls = []
+    monkeypatch.setattr(issues, 'verify_crash_issue', lambda *_a, **_k: None)
+    monkeypatch.setattr(issues, 'record_fix_progress', lambda *_a, **_k: None)
+    monkeypatch.setattr(issues, 'report_for_human',
+                        lambda _g, _context, reason, _c: reports.append(reason) or {'outcome': 'manual'})
+    monkeypatch.setattr('crashlytics_automation.fix_generation.existing_fix', lambda *_a, **_k: None)
+    monkeypatch.setattr('crashlytics_automation.release_source.resolve_release_commit',
+                        lambda *_a, **_k: RELEASE_SHA)
+    monkeypatch.setattr('crashlytics_automation.pull_requests.branch_head_sha',
+                        lambda *_a, **_k: BASE_SHA)
+
+    def fail_after_execution(**kwargs):
+        model_calls.append(True)
+        kwargs['execute'](command='printf trace', timeout_seconds=30)
+        raise RuntimeError('Investigation input budget exceeded')
+
+    monkeypatch.setattr('crashlytics_automation.openai_client.request_fix_proposal', fail_after_execution)
+    monkeypatch.setattr('crashlytics_automation.sandbox.InvestigationSandbox', RecordingSandbox)
+    monkeypatch.setenv('CRASHLYTICS_OPENAI_API_KEY', 'test-only')
+    monkeypatch.setenv('CRASHLYTICS_GITHUB_APP_PRIVATE_KEY', 'sentinel-private-key')
+    job = _base_job()
+    job['analyses']['production'] = {'analysis': 'previous attempt', 'tools': []}
+
+    first = worker.run_job(CheckedOutGithub(), {'botLogin': 'autofix[bot]'}, job)
+    pending = copy.deepcopy(queue.latest)
+    trace = (tmp_path / 'artifacts' / 'investigation-tool-results.jsonl').read_text(encoding='utf-8')
+    record = json.loads(trace.splitlines()[0])
+
+    assert first == {'outcome': 'superseded', 'issueNumber': 17}
+    assert record['stdout'] == 'callback output [REDACTED] [REDACTED]'
+    assert 'test-only' not in trace and 'sentinel-private-key' not in trace
+    assert pending['status'] == 'manual' and pending['reportPending'] is True
+    assert pending['reason'] == 'Investigation input budget exceeded'
+    assert pending['analyses']['production']['analysis'].startswith('PARTIAL')
+    assert pending['analyses']['production']['previous']['analysis'] == 'previous attempt'
+    assert pending['analyses']['production']['tools'][0]['outputSummary'] == 'callback output [REDACTED] [REDACTED]\n'
+    attempts = copy.deepcopy(pending['attempts'])
+
+    worker.run_job(CheckedOutGithub(), {'botLogin': 'autofix[bot]'}, pending)
+
+    assert model_calls == [True]
+    assert queue.latest['attempts'] == attempts
+    assert not queue.latest.get('reportPending')
+    assert len(reports) == 2 and reports[0] == reports[1] == 'Investigation input budget exceeded'
 
 
 def test_report_failure_preserves_accepted_merge_tasks_and_retries_only_the_report(monkeypatch):

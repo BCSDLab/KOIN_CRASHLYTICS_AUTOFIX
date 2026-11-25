@@ -165,13 +165,32 @@ def _context(job: dict[str, Any]) -> Any:
 
 
 
+def _redact_secrets(value: str) -> str:
+    for key in ('CRASHLYTICS_OPENAI_API_KEY', 'CRASHLYTICS_GITHUB_APP_PRIVATE_KEY'):
+        secret = os.environ.get(key)
+        if secret:
+            value = value.replace(secret, '[REDACTED]')
+    return value
+
+
+def _redact_diagnostic(value: Any) -> Any:
+    if isinstance(value, str):
+        return _redact_secrets(value)
+    if isinstance(value, list):
+        return [_redact_diagnostic(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _redact_diagnostic(item) for key, item in value.items()}
+    return value
+
+
 def _report(github: Any, queue: Any, job: dict[str, Any], config: dict[str, Any]) -> dict[str, Any] | None:
     """Keep report delivery separate from investigation and merge authorization."""
     from requests import RequestException
     from .github import GitHubError
     from .issues import record_fix_progress, report_for_human
-    job['reportPending'] = True
-    queue.put(job)
+    if job.get('reportPending') is not True:
+        job['reportPending'] = True
+        queue.put(job)
     try:
         if job['status'] == 'manual':
             result = report_for_human(github, _context(job), job['reason'], config)
@@ -255,6 +274,8 @@ def run_job(github: Any, config: dict[str, Any], job: dict[str, Any]) -> dict[st
         queue.put(job)
         return {'outcome': 'closed', 'issueNumber': context.issue_number}
     target = next((branch for branch in TARGET_BRANCHES if branch not in job['branches']), None)
+    tool_trace: list[dict[str, Any]] = []
+    partial_analysis = True
     try:
         if job['status'] in ('manual', 'merging', 'complete') and job.get('reportPending') is True:
             result = _report(github, queue, job, config)
@@ -311,6 +332,21 @@ def run_job(github: Any, config: dict[str, Any], job: dict[str, Any]) -> dict[st
                         exports.callback(sandbox.export_artifacts, Path(artifacts) / job['id'] / target)
                     job['attempts'][target] = attempts + 1
                     queue.put(job)
+                    trace_path = sandbox.artifact_directory / 'investigation-tool-results.jsonl'
+                    trace_path.parent.mkdir(parents=True, exist_ok=True)
+
+                    def execute_and_record(*, command: str, timeout_seconds: int) -> dict[str, Any]:
+                        result = sandbox.execute(command=command, timeout_seconds=timeout_seconds)
+                        safe_result = dict(result)
+                        for field in ('stdout', 'stderr'):
+                            if isinstance(safe_result.get(field), str):
+                                safe_result[field] = _redact_secrets(safe_result[field])
+                        record = {'command': _redact_secrets(command), **safe_result}
+                        with trace_path.open('a', encoding='utf-8') as trace:
+                            trace.write(json.dumps(record, ensure_ascii=False) + '\n')
+                        tool_trace.append(record)
+                        return result
+
                     decision = request_fix_proposal(
                         model=os.environ.get('OPENAI_MODEL', DEFAULT_MODEL),
                         api_key=os.environ['CRASHLYTICS_OPENAI_API_KEY'],
@@ -324,22 +360,27 @@ def run_job(github: Any, config: dict[str, Any], job: dict[str, Any]) -> dict[st
                             'regressionTestName': regression_test_name(identity_hash),
                             'workspaces': {'release': '/workspace/release', 'target': '/workspace/target',
                                            'scratch': '/workspace/scratch'},
-                        }, execute=sandbox.execute,
+                        }, execute=execute_and_record,
                     )
                     if decision.get('toolResults'):
                         (sandbox.artifact_directory / 'investigation-tool-results.json').write_text(
-                            json.dumps(decision['toolResults'], ensure_ascii=False, indent=2), encoding='utf-8',
+                            json.dumps(_redact_diagnostic(decision['toolResults']), ensure_ascii=False, indent=2),
+                            encoding='utf-8',
                         )
                     job['analyses'][target] = {
-                        'analysis': decision['analysis'], 'reason': decision['reason'],
+                        'analysis': _redact_secrets(str(decision['analysis'])),
+                        'reason': _redact_secrets(str(decision['reason'])),
                         'tools': [{'tool': item.get('tool', 'run_command'),
-                                   'command': str(item.get('command', ''))[:500],
+                                   'command': _redact_secrets(str(item.get('command', '')))[:500],
                                    'exit_code': item.get('exit_code'), 'timed_out': item.get('timed_out')}
                                   for item in decision.get('toolResults', [])],
                     }
+                    partial_analysis = False
                     queue.put(job)
                     if decision['decision'] != 'fix':
-                        job['status'], job['reason'] = 'manual', decision['reason']
+                        job['status'], job['reason'] = 'manual', _redact_secrets(str(decision['reason']))
+                        job['reportPending'] = True
+                        queue.put(job)
                         return _report(github, queue, job, config) or {
                             'outcome': 'manual', 'issueNumber': context.issue_number,
                         }
@@ -385,12 +426,26 @@ def run_job(github: Any, config: dict[str, Any], job: dict[str, Any]) -> dict[st
         return {'outcome': 'superseded', 'issueNumber': context.issue_number}
     except Exception as error:
         from .privacy import safe_text
-        text = str(error)
-        for key in ('CRASHLYTICS_OPENAI_API_KEY', 'CRASHLYTICS_GITHUB_APP_PRIVATE_KEY'):
-            secret = os.environ.get(key)
-            if secret:
-                text = text.replace(secret, '[REDACTED]')
-        reason = safe_text(text, 1000) or type(error).__name__
+        reason = safe_text(_redact_secrets(str(error)), 1000) or type(error).__name__
+        if tool_trace and partial_analysis:
+            old_analysis = job['analyses'].get(target)
+            job['analyses'][target] = {
+                'analysis': 'PARTIAL investigation; no final model analysis was returned.',
+                'reason': reason,
+                'tools': [{
+                    'tool': 'run_command',
+                    'command': item.get('command', '')[:500],
+                    'exit_code': item.get('exit_code'),
+                    'timed_out': item.get('timed_out'),
+                    'outputSummary': (
+                        (item.get('stdout', '') + '\n' + item.get('stderr', ''))[:1000]
+                        if isinstance(item.get('stdout', ''), str)
+                        and isinstance(item.get('stderr', ''), str) else ''
+                    ),
+                } for item in tool_trace],
+            }
+            if old_analysis is not None:
+                job['analyses'][target]['previous'] = old_analysis
         if job['status'] == 'merging' or (job['status'] == 'queued' and target in job['branches']):
             job['reason'], job['reportPending'] = reason, True
             queue.put(job)
@@ -403,12 +458,16 @@ def run_job(github: Any, config: dict[str, Any], job: dict[str, Any]) -> dict[st
                 return {'outcome': 'superseded', 'issueNumber': context.issue_number}
             _report(github, queue, job, config)
             return {'outcome': 'delivering', 'issueNumber': context.issue_number}
-        job['status'], job['reason'] = 'manual', reason
+        job['status'], job['reason'], job['reportPending'] = 'manual', reason, True
         try:
             queue.put(job)
         except JobConflict:
             return {'outcome': 'superseded', 'issueNumber': context.issue_number}
-        return _report(github, queue, job, config) or {'outcome': 'manual', 'issueNumber': context.issue_number}
+        try:
+            result = _report(github, queue, job, config)
+        except JobConflict:
+            return {'outcome': 'superseded', 'issueNumber': context.issue_number}
+        return result or {'outcome': 'manual', 'issueNumber': context.issue_number}
 
 
 def main() -> int:
