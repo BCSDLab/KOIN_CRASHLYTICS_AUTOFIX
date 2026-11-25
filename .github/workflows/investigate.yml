@@ -13,6 +13,10 @@ on:
         description: Resume a manual source investigation from saved evidence, without a new capture
         type: boolean
         default: false
+      allow_extra_attempt:
+        description: Explicitly authorize one extra investigation for the exhausted current lane; keep saved evidence and counters
+        type: boolean
+        default: false
       notes:
         description: Additional research to verify; stored with the saved investigation state
         type: string
@@ -23,7 +27,7 @@ permissions:
 
 jobs:
   prepare:
-    if: github.event_name == 'workflow_dispatch' && (inputs.issue_number != '' || inputs.resume_manual || inputs.notes != '')
+    if: github.event_name == 'workflow_dispatch' && (inputs.issue_number != '' || inputs.resume_manual || inputs.allow_extra_attempt || inputs.notes != '')
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     env:
@@ -53,6 +57,7 @@ jobs:
         env:
           ISSUE_NUMBER: ${{ inputs.issue_number }}
           RESUME_MANUAL: ${{ inputs.resume_manual }}
+          ALLOW_EXTRA_ATTEMPT: ${{ inputs.allow_extra_attempt }}
           INVESTIGATION_NOTES: ${{ inputs.notes }}
         run: |
           args=()
@@ -61,6 +66,9 @@ jobs:
           fi
           if [[ "$RESUME_MANUAL" == 'true' ]]; then
             args+=(--resume-manual)
+          fi
+          if [[ "$ALLOW_EXTRA_ATTEMPT" == 'true' ]]; then
+            args+=(--allow-extra-attempt)
           fi
           python -m crashlytics_automation.worker --list-pending "${args[@]}"
 

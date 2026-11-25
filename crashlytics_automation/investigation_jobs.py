@@ -14,6 +14,8 @@ from .repository import REPOSITORY, REPOSITORY_PATH, STATE_REFERENCE, TARGET_BRA
 from .task_payloads import parse_alert_payload
 
 POLICY_VERSION = 2
+DEFAULT_ATTEMPT_LIMIT = 3
+APPROVED_ATTEMPT_LIMIT = DEFAULT_ATTEMPT_LIMIT + 1
 MAX_JOB_BYTES = 512 * 1024
 LEASE_MINUTES = 50
 _STATUSES = {'queued', 'running', 'delivering', 'merging', 'complete', 'manual'}
@@ -41,6 +43,7 @@ def new_job(alert: CrashAlert, evidence: dict[str, Any], issue_number: int) -> d
         'analyses': {},
         'branchBases': {},
         'attempts': {},
+        'attemptLimits': {},
     }
 
 
@@ -58,8 +61,14 @@ def validate_job(job: Any) -> None:
     for name in ('branches', 'analyses', 'attempts'):
         if not isinstance(job.get(name), dict) or not set(job[name]).issubset(TARGET_BRANCHES):
             raise ValueError('Invalid investigation target state')
-    for attempts in job['attempts'].values():
-        if type(attempts) is not int or not 0 <= attempts <= 3:
+    limits = job.get('attemptLimits', {})
+    if (
+        not isinstance(limits, dict) or not set(limits).issubset(TARGET_BRANCHES)
+        or any(type(limit) is not int or limit != APPROVED_ATTEMPT_LIMIT for limit in limits.values())
+    ):
+        raise ValueError('Invalid approved investigation limit')
+    for target, attempts in job['attempts'].items():
+        if type(attempts) is not int or not 0 <= attempts <= limits.get(target, DEFAULT_ATTEMPT_LIMIT):
             raise ValueError('Invalid investigation attempt count')
     deliveries = job.get('deliveryAttempts', 0)
     if type(deliveries) is not int or not 0 <= deliveries <= 3:

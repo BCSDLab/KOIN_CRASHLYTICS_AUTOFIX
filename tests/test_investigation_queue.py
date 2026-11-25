@@ -304,3 +304,31 @@ def test_pending_reports_remain_deliverable_without_reopening_analysis(status):
     queue.put(job)
     assert queue.pending() == []
     assert queue.get(alert)["status"] == status
+
+
+def test_fourth_attempt_requires_explicit_scoped_limit_and_round_trips():
+    github = MemoryGitHub()
+    queue = InvestigationQueue(github)
+    alert = service_context_alert()
+    job = new_job(alert, {'status': 'ready'}, 17)
+    job['status'] = 'manual'
+    job['attempts']['production'] = 4
+    with pytest.raises(ValueError):
+        queue.put(job)
+
+    job['attemptLimits'] = {'production': 4}
+    queue.put(job)
+    stored = queue.get(alert)
+    assert stored['attempts'] == {'production': 4}
+    assert stored['attemptLimits'] == {'production': 4}
+
+
+@pytest.mark.parametrize('limits', [
+    {'production': True}, {'production': 5}, {'unknown': 4},
+])
+def test_unbounded_or_malformed_attempt_grants_cannot_be_saved(limits):
+    queue = InvestigationQueue(MemoryGitHub())
+    job = new_job(service_context_alert(), {'status': 'ready'}, 17)
+    job['attemptLimits'] = limits
+    with pytest.raises(ValueError):
+        queue.put(job)

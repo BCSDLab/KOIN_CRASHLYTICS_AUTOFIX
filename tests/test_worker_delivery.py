@@ -251,7 +251,8 @@ def test_failed_trusted_verification_reports_analysis_without_publishing(monkeyp
     assert publications == []
 
 
-def test_interrupted_provider_failure_keeps_incremental_trace_and_retries_only_pending_report(monkeypatch, tmp_path):
+@pytest.mark.parametrize('prior_attempts', [0, 3])
+def test_interrupted_provider_failure_keeps_incremental_trace_and_retries_only_pending_report(monkeypatch, tmp_path, prior_attempts):
     from crashlytics_automation import issues
     from crashlytics_automation.investigation_jobs import JobConflict
 
@@ -308,6 +309,9 @@ def test_interrupted_provider_failure_keeps_incremental_trace_and_retries_only_p
     monkeypatch.setenv('CRASHLYTICS_OPENAI_API_KEY', 'test-only')
     monkeypatch.setenv('CRASHLYTICS_GITHUB_APP_PRIVATE_KEY', 'sentinel-private-key')
     job = _base_job()
+    job['attempts']['production'] = prior_attempts
+    if prior_attempts == 3:
+        job['attemptLimits'] = {'production': 4}
     job['analyses']['production'] = {'analysis': 'previous attempt', 'tools': []}
 
     first = worker.run_job(CheckedOutGithub(), {'botLogin': 'autofix[bot]'}, job)
@@ -319,6 +323,7 @@ def test_interrupted_provider_failure_keeps_incremental_trace_and_retries_only_p
     assert record['stdout'] == 'callback output [REDACTED] [REDACTED]'
     assert 'test-only' not in trace and 'sentinel-private-key' not in trace
     assert pending['status'] == 'manual' and pending['reportPending'] is True
+    assert pending['attempts']['production'] == prior_attempts + 1
     assert pending['reason'] == 'Investigation input budget exceeded'
     assert pending['analyses']['production']['analysis'].startswith('PARTIAL')
     assert pending['analyses']['production']['previous']['analysis'] == 'previous attempt'
@@ -461,3 +466,63 @@ def test_manual_resume_cannot_reopen_active_or_completed_work(monkeypatch, statu
         worker.prepare_existing_issue(ExistingIssueGithub(), {}, 17, resume_manual=True)
 
     assert queue.latest == original and queue.history == []
+
+
+@pytest.mark.parametrize('approved,limit', [(False, 3), (True, 4)])
+def test_extra_attempt_is_explicit_scoped_and_does_not_reset_usage(monkeypatch, approved, limit):
+    from crashlytics_automation import issues
+    queue = Queue()
+    original = _base_job('manual')
+    original['attempts']['production'] = 3
+    queue.latest = copy.deepcopy(original)
+    _patch_queue(monkeypatch, queue)
+    monkeypatch.setattr(issues, 'record_fix_progress', lambda *_a, **_k: None)
+    monkeypatch.setattr(worker, 'enqueue_task',
+                        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError('unexpected capture')))
+
+    for _ in range(2):
+        resumed = worker.prepare_existing_issue(
+            ExistingIssueGithub(), {'botLogin': 'autofix[bot]'}, 17,
+            resume_manual=True, notes='Operator research requests another attempt',
+            allow_extra_attempt=approved,
+        )
+        assert resumed['attempts'] == original['attempts']
+        assert resumed['evidence'] == original['evidence']
+        assert resumed.get('attemptLimits', {}).get('production', 3) == limit
+        assert 'develop' not in resumed.get('attemptLimits', {})
+
+
+@pytest.mark.parametrize('used,resume', [(2, True), (4, True), (3, False)])
+def test_extra_attempt_cannot_be_pregranted_replenished_or_used_without_resume(monkeypatch, used, resume):
+    queue = Queue()
+    original = _base_job('manual')
+    original['attempts']['production'] = used
+    if used == 4:
+        original['attemptLimits'] = {'production': 4}
+    queue.latest = copy.deepcopy(original)
+    _patch_queue(monkeypatch, queue)
+    with pytest.raises(ValueError):
+        worker.prepare_existing_issue(
+            ExistingIssueGithub(), {}, 17, resume_manual=resume, allow_extra_attempt=True,
+        )
+    assert queue.latest == original and queue.history == []
+
+
+def test_exhausted_extra_attempt_never_starts_another_model(monkeypatch):
+    from crashlytics_automation import issues
+    queue = Queue()
+    _patch_queue(monkeypatch, queue)
+    job = _base_job()
+    job['attempts']['production'] = 4
+    job['attemptLimits'] = {'production': 4}
+    job['releaseSha'] = RELEASE_SHA
+    monkeypatch.setattr(issues, 'verify_crash_issue', lambda *_a, **_k: None)
+    monkeypatch.setattr(issues, 'record_fix_progress', lambda *_a, **_k: None)
+    monkeypatch.setattr(issues, 'report_for_human', lambda *_a, **_k: {'outcome': 'manual'})
+    monkeypatch.setattr('crashlytics_automation.fix_generation.existing_fix', lambda *_a, **_k: None)
+    monkeypatch.setattr('crashlytics_automation.pull_requests.branch_head_sha', lambda *_a, **_k: BASE_SHA)
+    monkeypatch.setattr('crashlytics_automation.openai_client.request_fix_proposal',
+                        lambda **_k: (_ for _ in ()).throw(AssertionError('fifth model attempt')))
+    worker.run_job(Github(), {'botLogin': 'autofix[bot]'}, job)
+    assert queue.latest['attempts']['production'] == 4
+    assert queue.latest['status'] == 'manual'

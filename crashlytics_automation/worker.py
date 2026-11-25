@@ -82,13 +82,16 @@ def enqueue_task(config: dict[str, Any], function: str, identity: str, data: dic
 def prepare_existing_issue(
     github: Any, config: dict[str, Any], issue_number: int, *,
     resume_manual: bool = False, notes: str | None = None,
+    allow_extra_attempt: bool = False,
 ) -> Any:
     """Capture once, or explicitly resume source investigation from existing evidence."""
     from .github import issue_marker
-    from .investigation_jobs import InvestigationQueue, POLICY_VERSION
+    from .investigation_jobs import InvestigationQueue, POLICY_VERSION, DEFAULT_ATTEMPT_LIMIT, APPROVED_ATTEMPT_LIMIT
     from .repository import REPOSITORY_PATH, TARGET_BRANCHES
     from .task_payloads import parse_alert_payload
     from .privacy import safe_text
+    if allow_extra_attempt and not resume_manual:
+        raise ValueError('An extra attempt requires explicit resume of saved evidence')
 
     issue = github.rest('GET', f'{REPOSITORY_PATH}/issues/{issue_number}')
     body = issue.get('body') or ''
@@ -130,6 +133,11 @@ def prepare_existing_issue(
             raise ValueError('Only manual or queued source investigations can be resumed')
         if all(branch in job['branches'] for branch in TARGET_BRANCHES):
             raise ValueError('Both fixes already exist; source investigation must not be restarted')
+        if allow_extra_attempt:
+            target = next(branch for branch in TARGET_BRANCHES if branch not in job['branches'])
+            if job['attempts'].get(target, 0) != DEFAULT_ATTEMPT_LIMIT:
+                raise ValueError('Only one additional attempt after the default limit may be approved')
+            job.setdefault('attemptLimits', {})[target] = APPROVED_ATTEMPT_LIMIT
         job['status'] = 'queued'
         job.pop('reason', None)
         job.pop('reportPending', None)
@@ -256,7 +264,7 @@ def run_job(github: Any, config: dict[str, Any], job: dict[str, Any]) -> dict[st
     from requests import RequestException
     from .candidate import identity_hash_for, regression_test_name, validate_candidate
     from .fix_generation import existing_fix, publish_investigated_fix
-    from .investigation_jobs import InvestigationQueue, JobConflict
+    from .investigation_jobs import InvestigationQueue, JobConflict, DEFAULT_ATTEMPT_LIMIT
     from .issues import verify_crash_issue
     from .models import ManualReview
     from .openai_client import DEFAULT_MODEL, request_fix_proposal
@@ -311,7 +319,7 @@ def run_job(github: Any, config: dict[str, Any], job: dict[str, Any]) -> dict[st
                 raise ValueError('Existing PR has no durable investigated source anchor')
             published = resumed
         else:
-            if attempts >= 3:
+            if attempts >= job.get('attemptLimits', {}).get(target, DEFAULT_ATTEMPT_LIMIT):
                 raise RuntimeError('The investigation execution limit was reached')
             branch_base = branch_head_sha(github, 'production')
             base = branch_base if target == 'production' else branch_head_sha(github, target)
@@ -475,9 +483,12 @@ def main() -> int:
     parser.add_argument('--list-pending', action='store_true')
     parser.add_argument('--issue-number', type=int)
     parser.add_argument('--resume-manual', action='store_true')
+    parser.add_argument('--allow-extra-attempt', action='store_true')
     arguments = parser.parse_args()
     if arguments.issue_number is not None and arguments.issue_number < 1:
         parser.error('issue number must be positive')
+    if arguments.allow_extra_attempt and not arguments.resume_manual:
+        parser.error('an extra attempt requires explicit manual resume')
     notes = os.environ.get('INVESTIGATION_NOTES') or None
     if (arguments.resume_manual or notes) and arguments.issue_number is None:
         parser.error('manual resume and research notes require an issue number')
@@ -490,7 +501,8 @@ def main() -> int:
         jobs = [job for job in jobs if job['issueNumber'] == arguments.issue_number]
         if arguments.resume_manual or notes or not jobs:
             prepared = prepare_existing_issue(github, config, arguments.issue_number,
-                                              resume_manual=arguments.resume_manual, notes=notes)
+                                              resume_manual=arguments.resume_manual, notes=notes,
+                                              allow_extra_attempt=arguments.allow_extra_attempt)
             if prepared['status'] == 'queued':
                 jobs = [prepared]
     if arguments.list_pending:
