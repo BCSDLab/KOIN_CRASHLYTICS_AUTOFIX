@@ -14,7 +14,7 @@ on:
         type: boolean
         default: false
       notes:
-        description: Additional research to verify; stored in the target investigation branch
+        description: Additional research to verify; stored with the saved investigation state
         type: string
         required: false
 
