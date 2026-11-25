@@ -51,12 +51,13 @@ jobs:
           operation = os.environ['OPERATION']
           if operation not in ('status', 'pause', 'resume'):
               raise ValueError('Unsupported queue operation')
-          for queue in ('generateCrashlyticsFix', 'mergeCrashlyticsFix'):
+          queues = ('generateCrashlyticsFix', 'mergeCrashlyticsFix')
+          desired = {'pause': 'PAUSED', 'resume': 'RUNNING'}.get(operation)
+          for queue in queues:
               url = 'https://cloudtasks.googleapis.com/v2/projects/' + project + '/locations/us-central1/queues/' + queue
               response = session.get(url, timeout=30, allow_redirects=False)
               response.raise_for_status()
               state = response.json()['state']
-              desired = {'pause': 'PAUSED', 'resume': 'RUNNING'}.get(operation)
               if desired and state != desired:
                   response = session.post(url + ':' + operation, json={}, timeout=30, allow_redirects=False)
                   response.raise_for_status()
@@ -64,21 +65,20 @@ jobs:
                   if state != desired:
                       raise RuntimeError('Queue did not reach the requested state')
               print(json.dumps({'queue': queue, 'state': state}), flush=True)
-              pending = 0
-              inflight = 0
-              token = None
-              while True:
-                  params = {'pageSize': 1000, 'responseView': 'BASIC'}
-                  if token:
-                      params['pageToken'] = token
-                  response = session.get(url + '/tasks', params=params, timeout=30, allow_redirects=False)
-                  response.raise_for_status()
-                  payload = response.json()
-                  tasks = payload.get('tasks', [])
-                  pending += len(tasks)
-                  inflight += sum(task.get('dispatchCount', 0) > task.get('responseCount', 0) for task in tasks)
-                  token = payload.get('nextPageToken')
-                  if not token:
-                      break
-              print(json.dumps({'queue': queue, 'pendingTasks': pending, 'inflightTasks': inflight}), flush=True)
+          # Read aggregate statistics after controlling both queues; never list task payloads.
+          for queue in queues:
+              url = 'https://cloudtasks.googleapis.com/v2beta3/projects/' + project + '/locations/us-central1/queues/' + queue
+              response = session.get(url, params={'readMask': 'name,state,stats'}, timeout=30, allow_redirects=False)
+              response.raise_for_status()
+              payload = response.json()
+              if 'stats' not in payload:
+                  raise RuntimeError('Queue statistics are unavailable; migration cannot proceed')
+              if desired and payload['state'] != desired:
+                  raise RuntimeError('Queue state changed during maintenance')
+              stats = payload['stats']
+              print(json.dumps({
+                  'queue': queue,
+                  'pendingTasks': int(stats.get('tasksCount', '0')),
+                  'inflightTasks': int(stats.get('concurrentDispatchesCount', '0')),
+              }), flush=True)
           PY
