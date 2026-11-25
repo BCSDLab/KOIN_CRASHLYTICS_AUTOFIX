@@ -215,6 +215,21 @@ def _request_payload(
     return payload
 
 
+def _provider_error_details(body: Any, api_key: str) -> tuple[str | None, str | None]:
+    error = body.get('error') if isinstance(body, dict) else None
+    if not isinstance(error, dict):
+        return None, None
+    code = error.get('code') or error.get('type')
+    if not isinstance(code, str) or code == api_key or re.fullmatch(r'[a-z_][a-z0-9_]{0,63}', code) is None:
+        code = None
+    parameter = error.get('param')
+    match = re.match(r'[a-z_]+', parameter) if isinstance(parameter, str) else None
+    parameter = match.group() if match else None
+    if parameter not in {'model', 'input', 'max_output_tokens', 'tools', 'tool_choice', 'text', 'store', 'include', 'reasoning'}:
+        parameter = None
+    return code, parameter
+
+
 def _response(
     http: Any,
     api_key: str,
@@ -242,9 +257,18 @@ def _response(
     except requests.RequestException as error:
         raise FixProposalResponseError('OpenAI request failed', code='provider_error') from error
     if response.status_code >= 400:
-        raise FixProposalResponseError(
-            f'OpenAI API returned {response.status_code}', status=int(response.status_code),
-        )
+        try:
+            error_body = response.json()
+        except (AttributeError, ValueError):
+            error_body = None
+        code, parameter = _provider_error_details(error_body, api_key)
+        details = ', '.join(item for item in (
+            f'code={code}' if code else '', f'param={parameter}' if parameter else '',
+        ) if item)
+        message = f'OpenAI API returned {response.status_code}'
+        if details:
+            message += f' ({details})'
+        raise FixProposalResponseError(message, code=code, status=int(response.status_code))
     try:
         result = response.json()
     except ValueError as error:
@@ -259,8 +283,7 @@ def _response(
             code='incomplete_model_response',
         )
     if result.get('status') == 'failed':
-        error = result.get('error')
-        code = error.get('code') if isinstance(error, dict) else None
+        code, _parameter = _provider_error_details(result, api_key)
         raise FixProposalResponseError(
             f'OpenAI response failed: {code if isinstance(code, str) else "unknown"}',
             code='failed_model_response',

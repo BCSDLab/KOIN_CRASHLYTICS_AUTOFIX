@@ -361,6 +361,30 @@ def test_provider_errors_do_not_echo_credentials_or_provider_body():
     assert 'provider details' not in str(error.value)
 
 
+@pytest.mark.parametrize('provider_code,expected_code', [
+    ('context_length_exceeded', 'context_length_exceeded'),
+    ('secret_key', None),
+])
+def test_provider_failure_reports_safe_diagnostics_without_raw_body(provider_code, expected_code):
+    class ErrorSession:
+        def post(self, *_args, **_kwargs):
+            response = FakeResponse({'error': {
+                'code': provider_code,
+                'param': 'input[3].secret_key',
+                'message': 'secret_key private provider details',
+            }})
+            response.status_code = 400
+            return response
+
+    with pytest.raises(FixProposalResponseError) as error:
+        request_fix_proposal(
+            api_key='secret_key', context={}, execute=lambda **_: None, session=ErrorSession(),
+        )
+    assert error.value.status == 400 and error.value.code == expected_code
+    assert 'param=input' in str(error.value)
+    assert 'secret_key' not in str(error.value) and 'private provider details' not in str(error.value)
+
+
 def test_provider_timeout_and_token_limit_are_reported_without_secret_echo():
     import requests
 

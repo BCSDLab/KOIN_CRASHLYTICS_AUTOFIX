@@ -268,6 +268,7 @@ class InvestigationSandbox:
             args.extend(['--device', '/dev/kvm:/dev/kvm'])
         args.extend([
             '-e', 'HOME=/home', '-e', 'JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64',
+            '-e', 'JAVA_TOOL_OPTIONS=-Duser.home=/home', '-e', 'GRADLE_USER_HOME=/home/.gradle',
             '-e', 'ANDROID_HOME=/opt/android-sdk', '-e', 'ANDROID_SDK_ROOT=/opt/android-sdk',
             '-e', 'ANDROID_AVD_HOME=/home/.android/avd',
             '-e', 'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/android-sdk/platform-tools:/opt/android-sdk/emulator:/opt/android-sdk/cmdline-tools/latest/bin',
