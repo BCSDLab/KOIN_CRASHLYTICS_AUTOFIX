@@ -83,6 +83,7 @@ def prepare_existing_issue(
     github: Any, config: dict[str, Any], issue_number: int, *,
     resume_manual: bool = False, notes: str | None = None,
     allow_extra_attempt: bool = False,
+    verification_only: bool = False,
 ) -> Any:
     """Capture once, or explicitly resume source investigation from existing evidence."""
     from .github import issue_marker
@@ -92,6 +93,8 @@ def prepare_existing_issue(
     from .privacy import safe_text
     if allow_extra_attempt and not resume_manual:
         raise ValueError('An extra attempt requires explicit resume of saved evidence')
+    if verification_only and not resume_manual:
+        raise ValueError('Verification-only requires explicit resume of saved evidence')
 
     issue = github.rest('GET', f'{REPOSITORY_PATH}/issues/{issue_number}')
     body = issue.get('body') or ''
@@ -142,6 +145,8 @@ def prepare_existing_issue(
         job.pop('reason', None)
         job.pop('reportPending', None)
         job['verificationResumeRequired'] = False
+        if verification_only:
+            job['verificationOnly'] = True
         changed = True
     if notes:
         if job['status'] != 'queued':
@@ -613,6 +618,7 @@ def main() -> int:
             prepared = prepare_existing_issue(
                 github, config, arguments.issue_number, resume_manual=arguments.resume_manual,
                 notes=notes, allow_extra_attempt=arguments.allow_extra_attempt,
+                verification_only=arguments.verification_only,
             )
             if prepared['status'] == 'queued':
                 jobs = [prepared]

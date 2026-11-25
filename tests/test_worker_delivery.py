@@ -471,7 +471,8 @@ class ExistingIssueGithub(Github):
 
 
 @pytest.mark.parametrize('attempts', [1, 3])
-def test_manual_resume_reuses_captured_evidence_and_preserves_the_model_budget(monkeypatch, attempts):
+@pytest.mark.parametrize('verification_only', [False, True])
+def test_manual_resume_reuses_captured_evidence_and_preserves_the_model_budget(monkeypatch, attempts, verification_only):
     from crashlytics_automation import issues
 
     queue = Queue()
@@ -489,6 +490,7 @@ def test_manual_resume_reuses_captured_evidence_and_preserves_the_model_budget(m
     resumed = worker.prepare_existing_issue(
         ExistingIssueGithub(), {'botLogin': 'autofix[bot]'}, 17,
         resume_manual=True, notes='Zero-width hypothesis; token=private-value',
+        verification_only=verification_only,
     )
 
     assert resumed['status'] == queue.latest['status'] == 'queued'
@@ -499,6 +501,9 @@ def test_manual_resume_reuses_captured_evidence_and_preserves_the_model_budget(m
     assert 'private-value' not in resumed['operatorNotes']
     assert 'reason' not in resumed and 'reportPending' not in resumed
     assert reports[-1].evidence['investigation']['status'] == 'queued'
+    if verification_only:
+        assert resumed['verificationOnly'] is True
+        assert all(saved.get('verificationOnly') is True for saved in queue.history)
 
 
 def test_manual_resume_without_saved_evidence_cannot_request_another_capture(monkeypatch):

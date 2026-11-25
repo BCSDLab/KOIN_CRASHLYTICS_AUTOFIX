@@ -423,3 +423,32 @@ def test_reachable_malformed_proposal_envelope_is_rejected():
     queue.put(job)
     with pytest.raises(ValueError, match='identity'):
         queue.get_proposal(queue.get(service_context_alert()), 'production')
+
+
+def test_serial_state_writes_survive_stale_ref_reads_without_losing_updates():
+    from crashlytics_automation.task_payloads import parse_alert_payload
+
+    class LaggingReference(MemoryGitHub):
+        visible_head = None
+
+        def rest(self, method, path, body=None):
+            if self.visible_head is not None and method == 'GET' and path == (
+                f'{REPOSITORY_PATH}/git/ref/{STATE_REFERENCE.removeprefix("refs/")}'
+            ):
+                return {'object': {'sha': self.visible_head}}
+            return super().rest(method, path, body)
+
+    github = LaggingReference()
+    queue = InvestigationQueue(github)
+    alert = parse_alert_payload(ALERT)
+    job = new_job(alert, {'status': 'ready'}, 17)
+    queue.put(job)
+    github.visible_head = github.refs[STATE_REFERENCE]
+    job['attempts']['production'] = 1
+    queue.put(job)
+    job['analyses']['production'] = {'analysis': 'Completed investigation'}
+    queue.put(job)
+    github.visible_head = None
+    saved = InvestigationQueue(github).get(alert)
+    assert saved['attempts'] == {'production': 1}
+    assert saved['analyses']['production']['analysis'] == 'Completed investigation'

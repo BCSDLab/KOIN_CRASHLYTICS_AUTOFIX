@@ -142,6 +142,7 @@ def proposal_envelope(
 class InvestigationQueue:
     def __init__(self, github: Any) -> None:
         self.github = github
+        self._written_head: str | None = None
 
     def _head(self) -> str | None:
         try:
@@ -296,7 +297,7 @@ class InvestigationQueue:
         if sha is None:
             return None
         if not isinstance(sha, str) or _SHA.fullmatch(sha) is None or (
-            self._entries(self._head()).get(self._proposal_path(job, target)) != sha
+            self._entries(self._written_head or self._head()).get(self._proposal_path(job, target)) != sha
         ):
             raise ValueError('Proposal pointer is malformed or unreachable')
         result = self.github.rest('GET', f'{REPOSITORY_PATH}/git/blobs/{sha}')
@@ -377,9 +378,13 @@ class InvestigationQueue:
         if not isinstance(blob_sha, str) or _SHA.fullmatch(blob_sha) is None:
             raise ValueError('Invalid new investigation blob')
         # Fast-forward-only updates and a per-job blob comparison prevent lost updates.
-        for _ in range(3):
-            head = self._head()
+        for attempt in range(3):
+            head = self._written_head if attempt == 0 and self._written_head is not None else self._head()
             entries = self._entries(head)
+            if head is not None and head == self._written_head and entries.get(f'jobs/{job["id"]}.json') != expected:
+                self._written_head = None
+                head = self._head()
+                entries = self._entries(head)
             if entries.get(f'jobs/{job["id"]}.json') != expected:
                 raise JobConflict('Investigation changed concurrently')
             changed = [{
@@ -419,8 +424,10 @@ class InvestigationQueue:
                     })
             except Exception as error:
                 if getattr(error, 'status', None) in (409, 422):
+                    self._written_head = None
                     continue
                 raise
             job['_blobSha'] = blob_sha
+            self._written_head = commit['sha']
             return
         raise JobConflict('Investigation metadata reference changed concurrently')
