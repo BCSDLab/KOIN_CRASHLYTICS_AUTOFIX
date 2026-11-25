@@ -14,12 +14,16 @@ from .repository import REPOSITORY, REPOSITORY_PATH, STATE_REFERENCE, TARGET_BRA
 from .task_payloads import parse_alert_payload
 
 POLICY_VERSION = 2
+PROPOSAL_VERSION = 1
 DEFAULT_ATTEMPT_LIMIT = 3
 APPROVED_ATTEMPT_LIMIT = DEFAULT_ATTEMPT_LIMIT + 1
 MAX_JOB_BYTES = 512 * 1024
-LEASE_MINUTES = 50
+MAX_PROPOSAL_BYTES = 2 * 1024 * 1024
+MAX_VERIFICATION_ATTEMPTS = 3
+LEASE_MINUTES = 65
 _STATUSES = {'queued', 'running', 'delivering', 'merging', 'complete', 'manual'}
 _SHA = re.compile(r'[0-9a-f]{40}')
+_SHA64 = re.compile(r'[0-9a-f]{64}')
 
 
 class JobConflict(RuntimeError):
@@ -58,9 +62,22 @@ def validate_job(job: Any) -> None:
     evidence = job.get('evidence')
     if not isinstance(evidence, dict) or evidence.get('status') != 'ready':
         raise ValueError('Investigation requires exported event evidence')
-    for name in ('branches', 'analyses', 'attempts'):
-        if not isinstance(job.get(name), dict) or not set(job[name]).issubset(TARGET_BRANCHES):
+    for name in ('branches', 'analyses', 'attempts', 'verificationAttempts'):
+        value = job.get(name, {})
+        if not isinstance(value, dict) or not set(value).issubset(TARGET_BRANCHES):
             raise ValueError('Invalid investigation target state')
+    for attempts in job.get('verificationAttempts', {}).values():
+        if type(attempts) is not int or not 0 <= attempts <= MAX_VERIFICATION_ATTEMPTS:
+            raise ValueError('Invalid verification attempt count')
+    proposal_refs = job.get('proposals', {})
+    if not isinstance(proposal_refs, dict) or not set(proposal_refs).issubset(TARGET_BRANCHES):
+        raise ValueError('Invalid investigation proposals')
+    if any(not isinstance(sha, str) or _SHA.fullmatch(sha) is None for sha in proposal_refs.values()):
+        raise ValueError('Invalid investigation proposal pointer')
+    if 'verificationOnly' in job and type(job['verificationOnly']) is not bool:
+        raise ValueError('Invalid verification-only state')
+    if 'verificationResumeRequired' in job and type(job['verificationResumeRequired']) is not bool:
+        raise ValueError('Invalid verification resume state')
     limits = job.get('attemptLimits', {})
     if (
         not isinstance(limits, dict) or not set(limits).issubset(TARGET_BRANCHES)
@@ -107,6 +124,21 @@ def _available(job: dict[str, Any], now: datetime) -> bool:
         raise ValueError('Running investigation has no valid lease') from None
 
 
+def proposal_envelope(
+    job: dict[str, Any], target: str, decision: dict[str, Any], *,
+    release_sha: str, branch_base_sha: str, base_sha: str,
+) -> dict[str, Any]:
+    """Encode the same host-pinned proposal for durable storage and recovery artifacts."""
+    return {
+        'version': PROPOSAL_VERSION,
+        'identity': {'jobId': job['id'], 'target': target, 'releaseSha': release_sha,
+                     'branchBaseSha': branch_base_sha, 'baseSha': base_sha},
+        'proposal': {key: decision[key] for key in (
+            'decision', 'analysis', 'reason', 'sourcePath', 'sourceLine', 'files',
+        )},
+    }
+
+
 class InvestigationQueue:
     def __init__(self, github: Any) -> None:
         self.github = github
@@ -134,7 +166,7 @@ class InvestigationQueue:
             for entry in result['tree']
             if isinstance(entry, dict) and entry.get('type') == 'blob'
             and isinstance(entry.get('path'), str)
-            and re.fullmatch(r'(?:jobs|pending|active)/[0-9a-f]{64}\.json', entry['path'])
+            and re.fullmatch(r'(?:(?:jobs|pending|active)/[0-9a-f]{64}\.json|proposals/[0-9a-f]{64}\.json)', entry['path'])
             and isinstance(entry.get('sha'), str) and _SHA.fullmatch(entry['sha'])
         }
 
@@ -171,6 +203,166 @@ class InvestigationQueue:
         return sorted((job for job in jobs if _available(job, now)),
                       key=lambda job: (job['alert']['time'], job['id']))
 
+    @staticmethod
+    def _proposal_path(job: dict[str, Any], target: str) -> str:
+        digest = hashlib.sha256(f'{job["id"]}/{target}'.encode()).hexdigest()
+        return f'proposals/{digest}.json'
+
+    def save_proposal(
+        self, job: dict[str, Any], target: str, decision: dict[str, Any], *,
+        release_sha: str, branch_base_sha: str, base_sha: str,
+    ) -> dict[str, Any]:
+        from .candidate import SHA64, is_allowed_source_path, is_allowed_test_path
+        validate_job(job)
+        if target not in TARGET_BRANCHES or any(
+            not isinstance(value, str) or _SHA.fullmatch(value) is None
+            for value in (release_sha, branch_base_sha, base_sha)
+        ):
+            raise ValueError('Invalid proposal identity')
+        if job.get('releaseSha') != release_sha or job.get('branchBases', {}).get(target) != branch_base_sha:
+            raise ValueError('Proposal does not match pinned investigation identity')
+        if not isinstance(decision, dict) or decision.get('decision') != 'fix':
+            raise ValueError('Only fix proposals can be checkpointed')
+        files = decision.get('files')
+        if not isinstance(files, list) or not files or len(files) > 24:
+            raise ValueError('Invalid proposal files')
+        identity_hash = hashlib.sha256(
+            f'{REPOSITORY}/{parse_alert_payload(job["alert"]).issue_id}/{release_sha}'.encode()
+        ).hexdigest()
+        normalized, total, seen, kinds = [], 0, set(), set()
+        for item in files:
+            if not isinstance(item, dict) or set(item) != {
+                'path', 'kind', 'beforeSha256', 'afterSha256', 'content',
+            }:
+                raise ValueError('Invalid normalized proposal file')
+            path, content = item['path'], item['content']
+            kind = item['kind']
+            if not isinstance(path, str) or not isinstance(content, str) or (
+                kind == 'source' and not is_allowed_source_path(path)
+            ) or (kind == 'test' and not is_allowed_test_path(path, identity_hash)) or kind not in ('source', 'test'):
+                raise ValueError('Proposal contains a disallowed file')
+            if path in seen:
+                raise ValueError('Duplicate proposal path')
+            seen.add(path)
+            kinds.add(kind)
+            data = content.encode('utf-8')
+            total += len(data)
+            digest = hashlib.sha256(data).hexdigest()
+            if len(data) > 256 * 1024 or total > 1024 * 1024 or item['afterSha256'] != digest or (
+                kind == 'source' and (not isinstance(item['beforeSha256'], str)
+                                      or SHA64.fullmatch(item['beforeSha256']) is None)
+            ) or (kind == 'test' and item['beforeSha256'] is not None):
+                raise ValueError('Invalid proposal file hash or size')
+            normalized.append(dict(item))
+        if kinds != {'source', 'test'}:
+            raise ValueError('Proposal must include a source change and regression test')
+        if not is_allowed_source_path(decision.get('sourcePath')) or (
+            type(decision.get('sourceLine')) is not int or decision['sourceLine'] < 1
+        ) or not isinstance(decision.get('analysis'), str) or not decision['analysis'].strip() or (
+            not isinstance(decision.get('reason'), str) or not decision['reason'].strip()
+        ):
+            raise ValueError('Proposal has no complete source-anchored analysis')
+        envelope = proposal_envelope(
+            job, target, {**decision, 'files': normalized}, release_sha=release_sha,
+            branch_base_sha=branch_base_sha, base_sha=base_sha,
+        )
+        raw = json.dumps(envelope, ensure_ascii=False, separators=(',', ':'), allow_nan=False).encode()
+        if len(raw) > MAX_PROPOSAL_BYTES:
+            raise ValueError('Proposal is too large')
+        blob = self.github.rest('POST', f'{REPOSITORY_PATH}/git/blobs', {
+            'content': base64.b64encode(raw).decode('ascii'), 'encoding': 'base64',
+        })
+        sha = blob.get('sha') if isinstance(blob, dict) else None
+        if not isinstance(sha, str) or _SHA.fullmatch(sha) is None:
+            raise ValueError('Invalid proposal blob')
+        previous = job.setdefault('proposals', {}).get(target)
+        job['proposals'][target] = sha
+        try:
+            self.put(job)
+        except Exception:
+            if previous is None:
+                job['proposals'].pop(target, None)
+            else:
+                job['proposals'][target] = previous
+            raise
+        return envelope
+
+    def get_proposal(self, job: dict[str, Any], target: str) -> dict[str, Any] | None:
+        from .candidate import SHA64, is_allowed_source_path, is_allowed_test_path
+        validate_job(job)
+        if target not in TARGET_BRANCHES:
+            raise ValueError('Invalid proposal target')
+        sha = job.get('proposals', {}).get(target)
+        if sha is None:
+            return None
+        if not isinstance(sha, str) or _SHA.fullmatch(sha) is None or (
+            self._entries(self._head()).get(self._proposal_path(job, target)) != sha
+        ):
+            raise ValueError('Proposal pointer is malformed or unreachable')
+        result = self.github.rest('GET', f'{REPOSITORY_PATH}/git/blobs/{sha}')
+        encoded = result.get('content') if isinstance(result, dict) and result.get('encoding') == 'base64' else None
+        if not isinstance(encoded, str) or len(encoded) > MAX_PROPOSAL_BYTES * 2:
+            raise ValueError('Invalid proposal blob')
+        raw = base64.b64decode(encoded.replace('\n', ''), validate=True)
+        if len(raw) > MAX_PROPOSAL_BYTES:
+            raise ValueError('Proposal is too large')
+        envelope = json.loads(raw)
+        identity = envelope.get('identity') if isinstance(envelope, dict) else None
+        if not isinstance(envelope, dict) or type(envelope.get('version')) is not int or envelope['version'] != PROPOSAL_VERSION or (
+            set(envelope) != {'version', 'identity', 'proposal'} or not isinstance(identity, dict)
+        ):
+            raise ValueError('Stale or malformed proposal identity')
+        expected = {'jobId': job['id'], 'target': target, 'releaseSha': job.get('releaseSha'),
+                    'branchBaseSha': job.get('branchBases', {}).get(target)}
+        if set(identity) != {'jobId', 'target', 'releaseSha', 'branchBaseSha', 'baseSha'} or (
+            any(identity.get(key) != value for key, value in expected.items())
+            or not isinstance(identity.get('baseSha'), str) or _SHA.fullmatch(identity['baseSha']) is None
+        ):
+            raise ValueError('Stale or malformed proposal identity')
+        proposal = envelope.get('proposal')
+        if not isinstance(proposal, dict) or set(proposal) != {
+            'decision', 'analysis', 'reason', 'sourcePath', 'sourceLine', 'files',
+        } or proposal.get('decision') != 'fix' or (
+            not isinstance(proposal.get('analysis'), str) or not proposal['analysis'].strip()
+            or not isinstance(proposal.get('reason'), str) or not proposal['reason'].strip()
+            or not is_allowed_source_path(proposal.get('sourcePath'))
+            or type(proposal.get('sourceLine')) is not int or proposal['sourceLine'] < 1
+        ):
+            raise ValueError('Malformed proposal')
+        alert = parse_alert_payload(job['alert'])
+        identity_hash = hashlib.sha256(
+            f'{REPOSITORY}/{alert.issue_id}/{identity["releaseSha"]}'.encode()
+        ).hexdigest()
+        files, total = proposal.get('files'), 0
+        if not isinstance(files, list) or not files or len(files) > 24:
+            raise ValueError('Malformed proposal files')
+        seen, kinds = set(), set()
+        for item in files:
+            if not isinstance(item, dict) or set(item) != {
+                'path', 'kind', 'beforeSha256', 'afterSha256', 'content',
+            } or not isinstance(item.get('content'), str) or not isinstance(item.get('path'), str):
+                raise ValueError('Malformed proposal file')
+            data = item['content'].encode('utf-8')
+            total += len(data)
+            kind = item.get('kind')
+            allowed = is_allowed_source_path(item.get('path')) if kind == 'source' else (
+                is_allowed_test_path(item.get('path'), identity_hash) if kind == 'test' else False
+            )
+            if item['path'] in seen:
+                raise ValueError('Duplicate proposal path')
+            seen.add(item['path'])
+            kinds.add(kind)
+            before = item.get('beforeSha256')
+            if not allowed or len(data) > 256 * 1024 or total > 1024 * 1024 or (
+                hashlib.sha256(data).hexdigest() != item.get('afterSha256')
+            ) or (kind == 'source' and (not isinstance(before, str) or SHA64.fullmatch(before) is None)) or (
+                kind == 'test' and before is not None
+            ):
+                raise ValueError('Malformed proposal file hash or size')
+        if kinds != {'source', 'test'}:
+            raise ValueError('Proposal must include a source change and regression test')
+        return envelope
+
     def put(self, job: dict[str, Any]) -> None:
         validate_job(job)
         payload = {key: value for key, value in job.items() if key != '_blobSha'}
@@ -202,6 +394,11 @@ class InvestigationQueue:
                     changed.append({'path': index_path, 'mode': '100644', 'type': 'blob', 'sha': blob_sha})
                 elif index_path in entries:
                     changed.append({'path': index_path, 'mode': '100644', 'type': 'blob', 'sha': None})
+            for proposal_target, proposal_sha in job.get('proposals', {}).items():
+                changed.append({
+                    'path': self._proposal_path(job, proposal_target), 'mode': '100644',
+                    'type': 'blob', 'sha': proposal_sha,
+                })
             tree_body: dict[str, Any] = {'tree': changed}
             if head is not None:
                 parent = self.github.rest('GET', f'{REPOSITORY_PATH}/git/commits/{head}')

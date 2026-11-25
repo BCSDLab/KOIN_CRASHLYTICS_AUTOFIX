@@ -345,8 +345,10 @@ class InvestigationSandbox:
 
     def verify_candidate(self, *, files: list[dict[str, Any]], identity_hash: str) -> dict[str, Any]:
         """Reproduce every proposed regression against clean base, then verify fixes."""
+        if self._model_container is not None:
+            self._stop_container(self._model_container)
         checks: list[dict[str, Any]] = []
-        deadline = time.monotonic() + 900
+        deadline = time.monotonic() + 1800
         verifier: str | None = None
         try:
             test_name = regression_test_name(identity_hash)
@@ -433,6 +435,14 @@ class InvestigationSandbox:
                     baseline = self._run(verifier, command, remaining)
                     self._stop_container(verifier)
                     verifier = None
+                    if instrumented and _instrumentation_setup_failure(baseline):
+                        _save_verification_artifacts(run_artifacts, f'baseline-{index}', baseline, None, workspace)
+                        checks.append({
+                            'phase': 'baseline', 'path': test['path'].as_posix(),
+                            'exit_code': baseline['exit_code'], 'timed_out': baseline['timed_out'],
+                            'test_result': 'setup-failure', 'evidence': None,
+                        })
+                        return {'passed': False, 'reason': 'trusted Android instrumentation setup failed', 'checks': checks}
                     if not instrumented:
                         baseline_unit[module] = baseline
                 task = (':'.join(module.parts) + ':connectedDebugAndroidTest'
@@ -483,6 +493,14 @@ class InvestigationSandbox:
                     after = self._run(verifier, command, remaining)
                     self._stop_container(verifier)
                     verifier = None
+                    if instrumented and _instrumentation_setup_failure(after):
+                        _save_verification_artifacts(run_artifacts, f'candidate-{index}', after, None, workspace)
+                        checks.append({
+                            'phase': 'candidate', 'path': test['path'].as_posix(),
+                            'exit_code': after['exit_code'], 'timed_out': after['timed_out'],
+                            'test_result': 'setup-failure', 'evidence': None,
+                        })
+                        return {'passed': False, 'reason': 'trusted Android instrumentation setup failed', 'checks': checks}
                     if not instrumented:
                         candidate_unit[module] = after
                 task = (':'.join(module.parts) + ':connectedDebugAndroidTest'
@@ -600,23 +618,51 @@ def _unit_test_task(output: str, module_task: str) -> str | None:
     return None
 
 
+_INSTRUMENTATION_GRADLE_ARGS = (
+    '--no-daemon --stacktrace --max-workers=2 --no-configuration-cache '
+    '-Dorg.gradle.jvmargs=-Xmx1536m -Pkotlin.compiler.execution.strategy=in-process'
+)
+
+
+def _instrumentation_setup_failure(result: dict[str, Any]) -> bool:
+    return 'VERIFICATION_SETUP_FAILURE:' in (result.get('stdout', '') + result.get('stderr', ''))
+
+
 def _instrumentation_command(task: str, test_class: str, log_name: str) -> str:
     class_filter = shlex.quote(test_class)
     log_path = shlex.quote(f'/workspace/scratch/{log_name}')
-    return (
-        'mkdir -p \"$HOME/.android/avd\"; '
-        'echo no | avdmanager create avd --force --name crashlytics-verification '
-        '--package \"system-images;android-34;google_apis;x86_64\" --device pixel_2 >/tmp/avd.log 2>&1; '
-        'emulator -avd crashlytics-verification -no-window -no-audio -no-boot-anim '
-        '-gpu swiftshader_indirect -no-snapshot -wipe-data >/tmp/emulator.log 2>&1 & '
-        "EMULATOR_PID=$!; trap 'kill \"$EMULATOR_PID\" 2>/dev/null || true' EXIT; "
-        'adb wait-for-device; '
-        'until [ \"$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d \"\\\\r\")\" = 1 ]; do sleep 2; done; '
-        'adb logcat -c; '
-        f'./gradlew --no-daemon --stacktrace {task} '
-        f'-Pandroid.testInstrumentationRunnerArguments.class={class_filter}; result=$?; '
-        f'adb logcat -d -v threadtime -t 20000 > {log_path}; exit \"$result\"'
-    )
+    module_task = ':'.join(part for part in task.split(':') if part).removesuffix(':connectedDebugAndroidTest')
+    return f'''set -u
+SCRATCH=/workspace/scratch
+mkdir -p "$HOME/.android/avd" "$SCRATCH"
+fail_setup() {{ echo "VERIFICATION_SETUP_FAILURE: $*" >&2; exit 70; }}
+echo no | avdmanager create avd --force --name crashlytics-verification --package "system-images;android-34;google_apis;x86_64" --device pixel_2 >"$SCRATCH/avdmanager.log" 2>&1 || fail_setup "AVD creation failed"
+test -s "$HOME/.android/avd/crashlytics-verification.avd/config.ini" || fail_setup "AVD configuration missing"
+./gradlew {_INSTRUMENTATION_GRADLE_ARGS} :{module_task}:assembleDebug :{module_task}:assembleDebugAndroidTest || fail_setup "pristine instrumentation APK build failed"
+emulator -avd crashlytics-verification -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect -no-snapshot -wipe-data -memory 1536 -cores 2 >"$SCRATCH/emulator.log" 2>&1 &
+EMULATOR_PID=$!
+trap 'kill "$EMULATOR_PID" 2>/dev/null || true; wait "$EMULATOR_PID" 2>/dev/null || true' EXIT
+READY=0
+BOOT_DEADLINE=$((SECONDS + 180))
+for _ in $(seq 1 90); do
+  [ "$SECONDS" -lt "$BOOT_DEADLINE" ] || break
+  kill -0 "$EMULATOR_PID" 2>/dev/null || fail_setup "emulator exited before boot"
+  if timeout 10s adb get-state 2>/dev/null | grep -qx device &&
+     [ "$(timeout 10s adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\\r')" = 1 ]; then READY=1; break; fi
+  sleep 2
+done
+[ "$READY" = 1 ] || fail_setup "emulator readiness timed out"
+timeout 10s adb logcat -c || fail_setup "could not clear emulator logcat"
+./gradlew {_INSTRUMENTATION_GRADLE_ARGS} {task} -Pandroid.testInstrumentationRunnerArguments.class={class_filter}
+RESULT=$?
+if kill -0 "$EMULATOR_PID" 2>/dev/null && timeout 10s adb get-state 2>/dev/null | grep -qx device; then
+  timeout 30s adb logcat -d -v threadtime -t 20000 > {log_path} 2>"$SCRATCH/logcat.stderr" || echo "logcat collection failed or timed out" >"$SCRATCH/logcat.status"
+else
+  echo "emulator disconnected; logcat unavailable" >"$SCRATCH/logcat.status"
+  fail_setup "emulator disconnected during instrumentation"
+fi
+exit "$RESULT"
+'''
 
 
 def _test_class_name(path: pathlib.PurePosixPath, content: str) -> str:

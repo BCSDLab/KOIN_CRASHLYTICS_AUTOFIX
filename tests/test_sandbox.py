@@ -10,8 +10,8 @@ import pytest
 
 from crashlytics_automation.candidate import regression_test_name
 from crashlytics_automation.sandbox import (
-    InvestigationSandbox, _COMMAND_WRAPPER, _matching_xml,
-    _read_regular_file, _save_verification_artifacts,
+    InvestigationSandbox, _COMMAND_WRAPPER, _instrumentation_command,
+    _matching_xml, _read_regular_file, _save_verification_artifacts,
 )
 
 IDENTITY = 'a' * 64
@@ -323,3 +323,70 @@ def test_run_removes_entire_container_on_inner_or_outer_timeout(tmp_path: Path, 
                 if process.poll() is None:
                     process.kill()
                     process.wait()
+
+
+def _fake_executable(path: Path, body: str) -> None:
+    path.write_text(f'#!/bin/sh\n{body}\n')
+    path.chmod(0o700)
+
+
+def _run_instrumentation_fixture(tmp_path: Path, monkeypatch, gradle: str, adb: str) -> tuple[subprocess.CompletedProcess, Path]:
+    bin_dir = tmp_path / 'bin'
+    bin_dir.mkdir()
+    home = tmp_path / 'home'
+    home.mkdir()
+    scratch = tmp_path / 'scratch'
+    scratch.mkdir()
+    _fake_executable(bin_dir / 'avdmanager', 'mkdir -p "$HOME/.android/avd/crashlytics-verification.avd"; echo fixture > "$HOME/.android/avd/crashlytics-verification.avd/config.ini"')
+    _fake_executable(bin_dir / 'emulator', 'exec sleep 20')
+    _fake_executable(bin_dir / 'adb', adb)
+    _fake_executable(bin_dir / 'timeout', 'shift; exec "$@"')
+    _fake_executable(bin_dir / 'seq', 'echo 1')
+    wrapper = tmp_path / 'gradlew'
+    _fake_executable(wrapper, gradle)
+    monkeypatch.setenv('PATH', f'{bin_dir}:{os.environ["PATH"]}')
+    monkeypatch.setenv('HOME', str(home))
+    command = _instrumentation_command(':domain:connectedDebugAndroidTest', 'example.GeneratedTest', 'run.logcat')
+    command = command.replace('/workspace/scratch', str(scratch))
+    completed = subprocess.run(['bash', '-c', command], cwd=tmp_path, capture_output=True, text=True, timeout=10)
+    return completed, scratch
+
+
+def test_instrumentation_build_failure_precedes_emulator_start(tmp_path: Path, monkeypatch) -> None:
+    completed, scratch = _run_instrumentation_fixture(
+        tmp_path, monkeypatch,
+        'echo "$*" >> "$HOME/gradle.log"; exit 1',
+        'exit 1',
+    )
+    assert completed.returncode == 70
+    assert 'VERIFICATION_SETUP_FAILURE: pristine instrumentation APK build failed' in completed.stderr
+    assert 'assembleDebug' in (tmp_path / 'home/gradle.log').read_text()
+    assert not (scratch / 'emulator.log').exists()
+
+
+def test_instrumentation_unready_emulator_is_bounded_setup_failure(tmp_path: Path, monkeypatch) -> None:
+    completed, scratch = _run_instrumentation_fixture(
+        tmp_path, monkeypatch,
+        'echo "$*" >> "$HOME/gradle.log"; exit 0',
+        'if [ "$1" = get-state ]; then echo offline; exit 1; fi; exit 1',
+    )
+    assert completed.returncode == 70
+    assert 'VERIFICATION_SETUP_FAILURE: emulator readiness timed out' in completed.stderr
+    assert 'assembleDebugAndroidTest' in (tmp_path / 'home/gradle.log').read_text()
+    assert (scratch / 'emulator.log').exists()
+
+
+def test_instrumentation_disconnection_does_not_hang_logcat_collection(tmp_path: Path, monkeypatch) -> None:
+    adb = '''case "$1" in
+get-state) count=0; [ -f "$HOME/adb-count" ] && count=$(cat "$HOME/adb-count"); count=$((count + 1)); echo "$count" > "$HOME/adb-count"; [ "$count" -eq 1 ] && echo device || echo offline ;;
+shell) echo 1 ;;
+logcat) exit 0 ;;
+esac'''
+    completed, scratch = _run_instrumentation_fixture(
+        tmp_path, monkeypatch,
+        'case "$*" in *assembleDebug*) exit 0 ;; *) exit 0 ;; esac',
+        adb,
+    )
+    assert completed.returncode == 70
+    assert 'VERIFICATION_SETUP_FAILURE: emulator disconnected during instrumentation' in completed.stderr
+    assert (scratch / 'logcat.status').read_text() == 'emulator disconnected; logcat unavailable\n'

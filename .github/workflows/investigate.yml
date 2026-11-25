@@ -17,6 +17,10 @@ on:
         description: Explicitly authorize one extra investigation for the exhausted current lane; keep saved evidence and counters
         type: boolean
         default: false
+      verification_only:
+        description: Re-verify and publish a saved proposal without a model call
+        type: boolean
+        default: false
       notes:
         description: Additional research to verify; stored with the saved investigation state
         type: string
@@ -27,7 +31,7 @@ permissions:
 
 jobs:
   prepare:
-    if: github.event_name == 'workflow_dispatch' && (inputs.issue_number != '' || inputs.resume_manual || inputs.allow_extra_attempt || inputs.notes != '')
+    if: github.event_name == 'workflow_dispatch' && (inputs.issue_number != '' || inputs.resume_manual || inputs.allow_extra_attempt || inputs.verification_only || inputs.notes != '')
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     env:
@@ -59,6 +63,7 @@ jobs:
           RESUME_MANUAL: ${{ inputs.resume_manual }}
           ALLOW_EXTRA_ATTEMPT: ${{ inputs.allow_extra_attempt }}
           INVESTIGATION_NOTES: ${{ inputs.notes }}
+          VERIFICATION_ONLY: ${{ inputs.verification_only }}
         run: |
           args=()
           if [[ -n "$ISSUE_NUMBER" ]]; then
@@ -70,6 +75,9 @@ jobs:
           if [[ "$ALLOW_EXTRA_ATTEMPT" == 'true' ]]; then
             args+=(--allow-extra-attempt)
           fi
+          if [[ "$VERIFICATION_ONLY" == 'true' ]]; then
+            args+=(--verification-only)
+          fi
           python -m crashlytics_automation.worker --list-pending "${args[@]}"
 
   investigate:
@@ -79,7 +87,7 @@ jobs:
       group: crashlytics-investigation-worker
       cancel-in-progress: false
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
     env:
       CRASHLYTICS_ENV: ${{ secrets.CRASHLYTICS_ENV }}
       CRASHLYTICS_GITHUB_APP_PRIVATE_KEY: ${{ secrets.CRASHLYTICS_GITHUB_APP_PRIVATE_KEY }}
@@ -108,10 +116,14 @@ jobs:
         id: queue
         env:
           ISSUE_NUMBER: ${{ inputs.issue_number }}
+          VERIFICATION_ONLY: ${{ inputs.verification_only }}
         run: |
           args=()
           if [[ -n "$ISSUE_NUMBER" ]]; then
             args+=(--issue-number "$ISSUE_NUMBER")
+          fi
+          if [[ "$VERIFICATION_ONLY" == 'true' ]]; then
+            args+=(--verification-only)
           fi
           python -m crashlytics_automation.worker --list-pending "${args[@]}"
 
@@ -146,9 +158,15 @@ jobs:
         if: steps.queue.outputs.pending == 'true'
         env:
           ISSUE_NUMBER: ${{ steps.queue.outputs.issue_number }}
-          CRASHLYTICS_OPENAI_API_KEY: ${{ secrets.CRASHLYTICS_OPENAI_API_KEY }}
+          CRASHLYTICS_OPENAI_API_KEY: ${{ !inputs.verification_only && secrets.CRASHLYTICS_OPENAI_API_KEY || '' }}
           INVESTIGATION_ARTIFACTS: ${{ runner.temp }}/crashlytics-artifacts
-        run: python -m crashlytics_automation.worker --issue-number "$ISSUE_NUMBER"
+          VERIFICATION_ONLY: ${{ inputs.verification_only }}
+        run: |
+          args=(--issue-number "$ISSUE_NUMBER")
+          if [[ "$VERIFICATION_ONLY" == 'true' ]]; then
+            args+=(--verification-only)
+          fi
+          python -m crashlytics_automation.worker "${args[@]}"
 
       - name: Upload public-repository reproduction artifacts
         if: always() && steps.queue.outputs.pending == 'true'

@@ -141,6 +141,7 @@ def prepare_existing_issue(
         job['status'] = 'queued'
         job.pop('reason', None)
         job.pop('reportPending', None)
+        job['verificationResumeRequired'] = False
         changed = True
     if notes:
         if job['status'] != 'queued':
@@ -264,7 +265,9 @@ def run_job(github: Any, config: dict[str, Any], job: dict[str, Any]) -> dict[st
     from requests import RequestException
     from .candidate import identity_hash_for, regression_test_name, validate_candidate
     from .fix_generation import existing_fix, publish_investigated_fix
-    from .investigation_jobs import InvestigationQueue, JobConflict, DEFAULT_ATTEMPT_LIMIT
+    from .investigation_jobs import (
+        InvestigationQueue, JobConflict, DEFAULT_ATTEMPT_LIMIT, MAX_VERIFICATION_ATTEMPTS, proposal_envelope,
+    )
     from .issues import verify_crash_issue
     from .models import ManualReview
     from .openai_client import DEFAULT_MODEL, request_fix_proposal
@@ -275,6 +278,8 @@ def run_job(github: Any, config: dict[str, Any], job: dict[str, Any]) -> dict[st
 
     queue = InvestigationQueue(github)
     context = _context(job)
+    if job.get('verificationOnly') is True or os.environ.get('CRASHLYTICS_VERIFICATION_ONLY') == '1':
+        os.environ.pop('CRASHLYTICS_OPENAI_API_KEY', None)
     verify_crash_issue(github, context)
     issue = github.rest('GET', f'{REPOSITORY_PATH}/issues/{context.issue_number}')
     if issue.get('state') != 'open':
@@ -290,6 +295,8 @@ def run_job(github: Any, config: dict[str, Any], job: dict[str, Any]) -> dict[st
             return result or {'outcome': job['status'], 'issueNumber': context.issue_number}
         if target is None:
             return _deliver(github, queue, job, config)
+        if job.get('verificationResumeRequired') is True:
+            raise RuntimeError('An explicit resume is required before retrying trusted verification')
         attempts = job['attempts'].get(target, 0)
         job['status'] = 'running'
         job['startedAt'] = datetime.now(timezone.utc).isoformat()
@@ -305,9 +312,15 @@ def run_job(github: Any, config: dict[str, Any], job: dict[str, Any]) -> dict[st
             if isinstance(release, ManualReview):
                 raise ValueError(release.reason)
         job['releaseSha'] = release
+        observed_origin = branch_head_sha(github, 'production')
         origin = job.get('branchBases', {}).get(target)
-        if origin is None:
-            origin = branch_head_sha(github, 'production')
+        checkpoint = queue.get_proposal(job, target)
+        if origin is not None and origin != observed_origin:
+            raise ValueError('Saved investigation production origin has changed')
+        origin = origin or observed_origin
+        target_base = branch_head_sha(github, target)
+        if checkpoint is not None and checkpoint['identity']['baseSha'] != target_base:
+            raise ValueError('Saved proposal target base has changed')
         resumed = existing_fix(github, alert=context.alert, issue_number=context.issue_number,
                                base_branch=target, bot_login=config['botLogin'], release_sha=release,
                                branch_base_sha=origin)
@@ -319,10 +332,11 @@ def run_job(github: Any, config: dict[str, Any], job: dict[str, Any]) -> dict[st
                 raise ValueError('Existing PR has no durable investigated source anchor')
             published = resumed
         else:
-            if attempts >= job.get('attemptLimits', {}).get(target, DEFAULT_ATTEMPT_LIMIT):
-                raise RuntimeError('The investigation execution limit was reached')
-            branch_base = branch_head_sha(github, 'production')
-            base = branch_base if target == 'production' else branch_head_sha(github, target)
+            attempts = job['attempts'].get(target, 0)
+            branch_base = origin
+            base = target_base
+            if checkpoint is not None and checkpoint['identity']['baseSha'] != base:
+                raise ValueError('Saved proposal target base has changed')
             job.setdefault('branchBases', {})[target] = branch_base
             identity_hash = identity_hash_for(context.alert.issue_id, release)
             with tempfile.TemporaryDirectory(prefix='crashlytics-investigation-') as temporary:
@@ -330,6 +344,7 @@ def run_job(github: Any, config: dict[str, Any], job: dict[str, Any]) -> dict[st
                 github.checkout(release, root / 'release')
                 github.checkout(branch_base, root / 'target')
                 repository = github.rest('GET', REPOSITORY_PATH)
+                proposal_provenance = job.get('analyses', {}).get(target, {}).get('proposalProvenance')
                 with InvestigationSandbox(
                     release=root / 'release', target=root / 'target',
                     image=os.environ.get('INVESTIGATION_IMAGE', 'crashlytics-investigator:local'),
@@ -338,8 +353,64 @@ def run_job(github: Any, config: dict[str, Any], job: dict[str, Any]) -> dict[st
                     artifacts = os.environ.get('INVESTIGATION_ARTIFACTS')
                     if artifacts and isinstance(repository, dict) and repository.get('private') is False:
                         exports.callback(sandbox.export_artifacts, Path(artifacts) / job['id'] / target)
-                    job['attempts'][target] = attempts + 1
-                    queue.put(job)
+                    def save_proposal_artifact(envelope: dict[str, Any]) -> None:
+                        content = json.dumps(envelope, ensure_ascii=False, indent=2) + '\n'
+                        local_artifact = sandbox.artifact_directory / 'proposal.json'
+                        local_artifact.parent.mkdir(parents=True, exist_ok=True)
+                        local_artifact.write_text(content, encoding='utf-8')
+                        if artifacts and isinstance(repository, dict) and repository.get('private') is False:
+                            artifact_path = Path(artifacts) / job['id'] / target / 'proposal.json'
+                            artifact_path.parent.mkdir(parents=True, exist_ok=True)
+                            artifact_path.write_text(content, encoding='utf-8')
+                    if checkpoint is None:
+                        for source_target in TARGET_BRANCHES:
+                            if source_target == target:
+                                continue
+                            source_checkpoint = queue.get_proposal(job, source_target)
+                            if source_checkpoint is None:
+                                continue
+                            source_identity = source_checkpoint['identity']
+                            if source_identity['releaseSha'] != release or (
+                                source_identity['branchBaseSha'] != branch_base
+                            ):
+                                continue
+                            source_decision = dict(source_checkpoint['proposal'])
+                            source_validated = validate_candidate(
+                                source_decision['files'],
+                                _baseline(root / 'target', source_decision['files'], identity_hash),
+                                identity_hash,
+                            )
+                            if not source_validated['valid']:
+                                continue
+                            decision = dict(source_decision)
+                            decision['files'] = source_validated['files']
+                            provenance = {
+                                'derivedFromTarget': source_target,
+                                'releaseSha': release,
+                                'branchBaseSha': branch_base,
+                                'sourceBaseSha': source_identity['baseSha'],
+                            }
+                            proposal_provenance = provenance
+                            job.setdefault('analyses', {}).setdefault(target, {})['proposalProvenance'] = provenance
+                            envelope = proposal_envelope(
+                                job, target, decision, release_sha=release,
+                                branch_base_sha=branch_base, base_sha=base,
+                            )
+                            save_proposal_artifact(envelope)
+                            checkpoint = queue.save_proposal(
+                                job, target, decision, release_sha=release,
+                                branch_base_sha=branch_base, base_sha=base,
+                            )
+                            break
+                    if checkpoint is None and (
+                        os.environ.get('CRASHLYTICS_VERIFICATION_ONLY') == '1' or job.get('verificationOnly') is True
+                    ):
+                        raise ValueError('Verification-only mode requires a saved proposal')
+                    if checkpoint is None and attempts >= job.get('attemptLimits', {}).get(target, DEFAULT_ATTEMPT_LIMIT):
+                        raise RuntimeError('The investigation execution limit was reached')
+                    if checkpoint is None:
+                        job['attempts'][target] = attempts + 1
+                        queue.put(job)
                     trace_path = sandbox.artifact_directory / 'investigation-tool-results.jsonl'
                     trace_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -355,36 +426,43 @@ def run_job(github: Any, config: dict[str, Any], job: dict[str, Any]) -> dict[st
                         tool_trace.append(record)
                         return result
 
-                    decision = request_fix_proposal(
-                        model=os.environ.get('OPENAI_MODEL', DEFAULT_MODEL),
-                        api_key=os.environ['CRASHLYTICS_OPENAI_API_KEY'],
-                        context={
-                            'issue': context.alert.to_payload(),
-                            'repository': REPOSITORY, 'releaseSha': release, 'baseBranch': 'production',
-                            'pullRequestTarget': target, 'pullRequestBaseSha': base,
-                            'operatorNotes': job.get('operatorNotes'),
-                            'priorInvestigations': job['analyses'],
-                            'baseSha': branch_base, 'crash': job['evidence'], 'identityHash': identity_hash,
-                            'regressionTestName': regression_test_name(identity_hash),
-                            'workspaces': {'release': '/workspace/release', 'target': '/workspace/target',
-                                           'scratch': '/workspace/scratch'},
-                        }, execute=execute_and_record,
-                    )
+                    if checkpoint is not None:
+                        decision = dict(checkpoint['proposal'])
+                    elif os.environ.get('CRASHLYTICS_VERIFICATION_ONLY') == '1' or job.get('verificationOnly') is True:
+                        raise ValueError('Verification-only mode requires a saved proposal')
+                    else:
+                        decision = request_fix_proposal(
+                            model=os.environ.get('OPENAI_MODEL', DEFAULT_MODEL),
+                            api_key=os.environ['CRASHLYTICS_OPENAI_API_KEY'],
+                            context={
+                                'issue': context.alert.to_payload(),
+                                'repository': REPOSITORY, 'releaseSha': release, 'baseBranch': 'production',
+                                'pullRequestTarget': target, 'pullRequestBaseSha': base,
+                                'operatorNotes': job.get('operatorNotes'),
+                                'priorInvestigations': job['analyses'],
+                                'baseSha': branch_base, 'crash': job['evidence'], 'identityHash': identity_hash,
+                                'regressionTestName': regression_test_name(identity_hash),
+                                'workspaces': {'release': '/workspace/release', 'target': '/workspace/target',
+                                               'scratch': '/workspace/scratch'},
+                            }, execute=execute_and_record,
+                        )
                     if decision.get('toolResults'):
                         (sandbox.artifact_directory / 'investigation-tool-results.json').write_text(
                             json.dumps(_redact_diagnostic(decision['toolResults']), ensure_ascii=False, indent=2),
                             encoding='utf-8',
                         )
+                    previous_tools = job['analyses'].get(target, {}).get('tools', [])
                     job['analyses'][target] = {
                         'analysis': _redact_secrets(str(decision['analysis'])),
                         'reason': _redact_secrets(str(decision['reason'])),
                         'tools': [{'tool': item.get('tool', 'run_command'),
                                    'command': _redact_secrets(str(item.get('command', '')))[:500],
                                    'exit_code': item.get('exit_code'), 'timed_out': item.get('timed_out')}
-                                  for item in decision.get('toolResults', [])],
+                                  for item in decision.get('toolResults', [])] if 'toolResults' in decision else previous_tools,
                     }
+                    if proposal_provenance is not None:
+                        job['analyses'][target]['proposalProvenance'] = proposal_provenance
                     partial_analysis = False
-                    queue.put(job)
                     if decision['decision'] != 'fix':
                         job['status'], job['reason'] = 'manual', _redact_secrets(str(decision['reason']))
                         job['reportPending'] = True
@@ -392,9 +470,29 @@ def run_job(github: Any, config: dict[str, Any], job: dict[str, Any]) -> dict[st
                         return _report(github, queue, job, config) or {
                             'outcome': 'manual', 'issueNumber': context.issue_number,
                         }
-                    validated = validate_candidate(decision['files'], _baseline(root / 'target', decision['files'], identity_hash), identity_hash)
+                    validated = validate_candidate(
+                        decision['files'], _baseline(root / 'target', decision['files'], identity_hash), identity_hash,
+                    )
                     if not validated['valid']:
                         raise ValueError(validated['reason'])
+                    decision = {key: value for key, value in decision.items() if key != 'toolResults'}
+                    decision['files'] = validated['files']
+                    envelope = proposal_envelope(
+                        job, target, decision, release_sha=release,
+                        branch_base_sha=branch_base, base_sha=base,
+                    )
+                    save_proposal_artifact(envelope)
+                    if checkpoint is None:
+                        queue.save_proposal(
+                            job, target, decision, release_sha=release,
+                            branch_base_sha=branch_base, base_sha=base,
+                        )
+                    retries = job.setdefault('verificationAttempts', {}).get(target, 0)
+                    if retries >= MAX_VERIFICATION_ATTEMPTS:
+                        raise RuntimeError('The trusted verification retry limit was reached')
+                    job['verificationResumeRequired'] = True
+                    job['verificationAttempts'][target] = retries + 1
+                    queue.put(job)
                     verification = sandbox.verify_candidate(files=validated['files'], identity_hash=identity_hash)
                     job['analyses'][target]['verification'] = {
                         'passed': verification.get('passed') is True, 'reason': str(verification.get('reason', ''))[:2000],
@@ -417,6 +515,7 @@ def run_job(github: Any, config: dict[str, Any], job: dict[str, Any]) -> dict[st
                     )
                     if isinstance(published, ManualReview):
                         raise ValueError(published.reason)
+                    job['verificationResumeRequired'] = False
                     job['branches'][target] = published.to_payload()
                     job['status'] = 'queued' if len(job['branches']) < len(TARGET_BRANCHES) else 'delivering'
                     queue.put(job)
@@ -483,12 +582,19 @@ def main() -> int:
     parser.add_argument('--list-pending', action='store_true')
     parser.add_argument('--issue-number', type=int)
     parser.add_argument('--resume-manual', action='store_true')
+    parser.add_argument('--verification-only', action='store_true')
     parser.add_argument('--allow-extra-attempt', action='store_true')
     arguments = parser.parse_args()
     if arguments.issue_number is not None and arguments.issue_number < 1:
         parser.error('issue number must be positive')
     if arguments.allow_extra_attempt and not arguments.resume_manual:
         parser.error('an extra attempt requires explicit manual resume')
+    if arguments.verification_only and arguments.issue_number is None:
+        parser.error('verification-only requires an issue number')
+    if arguments.verification_only:
+        arguments.resume_manual = True
+        os.environ['CRASHLYTICS_VERIFICATION_ONLY'] = '1'
+        os.environ['CRASHLYTICS_OPENAI_API_KEY'] = ''
     notes = os.environ.get('INVESTIGATION_NOTES') or None
     if (arguments.resume_manual or notes) and arguments.issue_number is None:
         parser.error('manual resume and research notes require an issue number')
@@ -496,15 +602,35 @@ def main() -> int:
     github = worker_github()
     from .investigation_jobs import InvestigationQueue
     from .repository import TARGET_BRANCHES
-    jobs = InvestigationQueue(github).pending()
+    queue = InvestigationQueue(github)
+    jobs = queue.pending()
     if arguments.issue_number is not None:
         jobs = [job for job in jobs if job['issueNumber'] == arguments.issue_number]
-        if arguments.resume_manual or notes or not jobs:
-            prepared = prepare_existing_issue(github, config, arguments.issue_number,
-                                              resume_manual=arguments.resume_manual, notes=notes,
-                                              allow_extra_attempt=arguments.allow_extra_attempt)
+        needs_prepare = not jobs or notes or (
+            arguments.resume_manual and not arguments.verification_only
+        ) or (arguments.verification_only and jobs[0]['status'] == 'manual')
+        if needs_prepare:
+            prepared = prepare_existing_issue(
+                github, config, arguments.issue_number, resume_manual=arguments.resume_manual,
+                notes=notes, allow_extra_attempt=arguments.allow_extra_attempt,
+            )
             if prepared['status'] == 'queued':
                 jobs = [prepared]
+    if arguments.verification_only and jobs:
+        if jobs[0].get('verificationOnly') is not True or jobs[0].get('verificationResumeRequired') is not False:
+            jobs[0]['verificationOnly'] = True
+            jobs[0]['verificationResumeRequired'] = False
+            queue.put(jobs[0])
+    if arguments.verification_only and jobs:
+        target = next((branch for branch in TARGET_BRANCHES if branch not in jobs[0]['branches']), None)
+        saved_proposal = target is not None and queue.get_proposal(jobs[0], target) is not None
+        if not saved_proposal and target is not None:
+            saved_proposal = any(
+                queue.get_proposal(jobs[0], other) is not None
+                for other in TARGET_BRANCHES if other != target
+            )
+        if not saved_proposal:
+            parser.error('verification-only requires saved evidence and a proposal')
     if arguments.list_pending:
         if os.environ.get('GITHUB_OUTPUT'):
             with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:

@@ -332,3 +332,94 @@ def test_unbounded_or_malformed_attempt_grants_cannot_be_saved(limits):
     job['attemptLimits'] = limits
     with pytest.raises(ValueError):
         queue.put(job)
+
+
+def _proposal_fixture(queue, job=None):
+    from crashlytics_automation.candidate import identity_hash_for, regression_test_name
+    from crashlytics_automation.investigation_jobs import new_job
+
+    alert = service_context_alert()
+    job = job or new_job(alert, {'status': 'ready'}, 17)
+    job['releaseSha'] = 'a' * 40
+    job.setdefault('branchBases', {})['production'] = 'b' * 40
+    identity = identity_hash_for(alert.issue_id, job['releaseSha'])
+    source_path = 'domain/src/main/kotlin/org/koin/Thing.kt'
+    source_content = 'package org.koin\nclass Thing { fun value() = 2 }\n'
+    test_path = f'domain/src/test/kotlin/org/koin/{regression_test_name(identity)}'
+    test_content = 'package org.koin\nclass RegressionTest\n'
+    import hashlib
+    files = [
+        {'path': source_path, 'kind': 'source', 'beforeSha256': 'c' * 64,
+         'afterSha256': hashlib.sha256(source_content.encode()).hexdigest(), 'content': source_content},
+        {'path': test_path, 'kind': 'test', 'beforeSha256': None,
+         'afterSha256': hashlib.sha256(test_content.encode()).hexdigest(), 'content': test_content},
+    ]
+    decision = {
+        'decision': 'fix', 'analysis': 'Root cause found in Thing.value.',
+        'reason': 'The source change addresses the crash.', 'sourcePath': source_path,
+        'sourceLine': 2, 'files': files,
+    }
+    return job, decision
+
+
+def test_proposal_checkpoint_is_versioned_reachable_and_excludes_tool_results():
+    github = MemoryGitHub()
+    queue = InvestigationQueue(github)
+    job, decision = _proposal_fixture(queue)
+    queue.put(job)
+    envelope = queue.save_proposal(
+        job, 'production', {**decision, 'toolResults': [{'stdout': 'must not persist'}]},
+        release_sha=job['releaseSha'], branch_base_sha='b' * 40, base_sha='d' * 40,
+    )
+    restored = queue.get_proposal(queue.get(service_context_alert()), 'production')
+    assert envelope['version'] == 1
+    assert envelope['identity'] == {
+        'jobId': job['id'], 'target': 'production', 'releaseSha': 'a' * 40,
+        'branchBaseSha': 'b' * 40, 'baseSha': 'd' * 40,
+    }
+    assert restored == envelope
+    assert 'toolResults' not in restored['proposal']
+    assert queue._proposal_path(job, 'production') in queue._entries(queue._head())
+
+
+def test_proposal_checkpoint_rejects_unreachable_or_malformed_pointer():
+    github = MemoryGitHub()
+    queue = InvestigationQueue(github)
+    job, _ = _proposal_fixture(queue)
+    queue.put(job)
+    job['proposals'] = {'production': 'f' * 40}
+    with pytest.raises(ValueError, match='unreachable'):
+        queue.get_proposal(job, 'production')
+
+
+def test_proposal_checkpoint_cas_conflict_does_not_overwrite_winner():
+    github = MemoryGitHub()
+    queue = InvestigationQueue(github)
+    job, decision = _proposal_fixture(queue)
+    queue.put(job)
+    stale = queue.get(service_context_alert())
+    winner = queue.get(service_context_alert())
+    winner['status'] = 'manual'
+    queue.put(winner)
+    with pytest.raises(JobConflict):
+        queue.save_proposal(
+            stale, 'production', decision, release_sha='a' * 40,
+            branch_base_sha='b' * 40, base_sha='d' * 40,
+        )
+    saved = queue.get(service_context_alert())
+    assert saved['status'] == 'manual'
+    assert saved.get('proposals', {}) == {}
+
+
+def test_reachable_malformed_proposal_envelope_is_rejected():
+    github = MemoryGitHub()
+    queue = InvestigationQueue(github)
+    job, _ = _proposal_fixture(queue)
+    queue.put(job)
+    malformed = github.rest('POST', f'{REPOSITORY_PATH}/git/blobs', {
+        'content': base64.b64encode(b'{"version":true}').decode(), 'encoding': 'base64',
+    })['sha']
+    job['proposals'] = {'production': malformed}
+    queue.put(job)
+    with pytest.raises(ValueError, match='identity'):
+        queue.get_proposal(queue.get(service_context_alert()), 'production')

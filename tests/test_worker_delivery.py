@@ -22,6 +22,7 @@ class Queue:
     def __init__(self):
         self.latest = None
         self.history = []
+        self.proposals = {}
 
     def get(self, _alert):
         return copy.deepcopy(self.latest)
@@ -30,6 +31,22 @@ class Queue:
         self.latest = copy.deepcopy(job)
         self.history.append(copy.deepcopy(job))
 
+    def get_proposal(self, _job, target):
+        return copy.deepcopy(self.proposals.get(target))
+
+    def save_proposal(self, job, target, decision, *, release_sha, branch_base_sha, base_sha):
+        envelope = {
+            'version': 1,
+            'identity': {'jobId': job['id'], 'target': target, 'releaseSha': release_sha,
+                         'branchBaseSha': branch_base_sha, 'baseSha': base_sha},
+            'proposal': {key: decision[key] for key in (
+                'decision', 'analysis', 'reason', 'sourcePath', 'sourceLine', 'files',
+            )},
+        }
+        self.proposals[target] = copy.deepcopy(envelope)
+        job.setdefault('proposals', {})[target] = '1' * 40
+        self.put(job)
+        return envelope
 
 class Github:
     def rest(self, method, path, *_args, **_kwargs):
@@ -37,6 +54,11 @@ class Github:
             return {'state': 'open'}
         if method == 'GET' and path == '/repos/BCSDLab/KOIN_ANDROID':
             return {'private': True}
+        if method == 'GET' and path in (
+            '/repos/BCSDLab/KOIN_ANDROID/git/ref/heads/production',
+            '/repos/BCSDLab/KOIN_ANDROID/git/ref/heads/develop',
+        ):
+            return {'object': {'sha': BASE_SHA}}
         raise AssertionError((method, path))
 
 
@@ -211,8 +233,8 @@ def test_failed_trusted_verification_reports_analysis_without_publishing(monkeyp
             raise AssertionError('provider output is already stubbed')
 
         def verify_candidate(self, **_kwargs):
+            assert target in queue.proposals
             return {'passed': False, 'reason': 'Regression test passed before the fix.'}
-
     queue = Queue()
     _patch_queue(monkeypatch, queue)
     reports = []
@@ -249,6 +271,42 @@ def test_failed_trusted_verification_reports_analysis_without_publishing(monkeyp
     assert reports and reports[0][1] == 'Regression test passed before the fix.'
     assert reports[0][0].evidence['investigation']['analyses'][target]['analysis'] == decision['analysis']
     assert publications == []
+    assert target in queue.latest['proposals']
+
+    resumed = copy.deepcopy(queue.latest)
+    resumed['verificationResumeRequired'] = False
+    resumed['status'] = 'queued'
+    resumed.pop('reportPending', None)
+    resumed.pop('reason', None)
+    resumed['attempts'][target] = 4
+    resumed['attemptLimits'][target] = 4
+    queue.put(resumed)
+    monkeypatch.delenv('CRASHLYTICS_OPENAI_API_KEY', raising=False)
+    monkeypatch.setattr(
+        'crashlytics_automation.openai_client.request_fix_proposal',
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError('resume must not call the model')),
+    )
+    worker.run_job(CheckedOutGithub(), {'botLogin': 'autofix[bot]'}, copy.deepcopy(queue.latest))
+    assert queue.latest['attempts'][target] == 4
+    assert queue.latest['verificationAttempts'][target] == 2
+
+    stale = copy.deepcopy(queue.latest)
+    stale['status'] = 'queued'
+    stale['verificationResumeRequired'] = False
+    stale['branchBases'][target] = '8' * 40
+    queue.put(stale)
+    worker.run_job(CheckedOutGithub(), {'botLogin': 'autofix[bot]'}, copy.deepcopy(queue.latest))
+    assert queue.latest['attempts'][target] == 4
+    assert queue.latest['verificationAttempts'][target] == 2
+
+    capped = copy.deepcopy(queue.latest)
+    capped['status'] = 'queued'
+    capped['verificationResumeRequired'] = False
+    capped['branchBases'][target] = BASE_SHA
+    capped['verificationAttempts'][target] = 3
+    queue.put(capped)
+    worker.run_job(CheckedOutGithub(), {'botLogin': 'autofix[bot]'}, copy.deepcopy(queue.latest))
+    assert queue.latest['verificationAttempts'][target] == 3
 
 
 @pytest.mark.parametrize('prior_attempts', [0, 3])
@@ -526,3 +584,89 @@ def test_exhausted_extra_attempt_never_starts_another_model(monkeypatch):
     worker.run_job(Github(), {'botLogin': 'autofix[bot]'}, job)
     assert queue.latest['attempts']['production'] == 4
     assert queue.latest['status'] == 'manual'
+
+
+@pytest.mark.parametrize('public', [False, True])
+def test_completed_proposal_recovery_survives_conflict_without_exposing_private_source(monkeypatch, tmp_path, public):
+    import shutil
+    from crashlytics_automation import issues
+    from crashlytics_automation.investigation_jobs import JobConflict
+
+    source_before = 'package org.koin\nclass Thing { fun value() = 1 }\n'
+    identity = identity_hash_for(ALERT.issue_id, RELEASE_SHA)
+    test_path = f'domain/src/test/kotlin/org/koin/{regression_test_name(identity)}'
+    decision = {
+        'decision': 'fix', 'analysis': 'An actual completed analysis.', 'reason': 'A proposed repair.',
+        'sourcePath': SOURCE_PATH, 'sourceLine': 2,
+        'files': [
+            {'path': SOURCE_PATH, 'content': 'package org.koin\nclass Thing { fun value() = 2 }\n'},
+            {'path': test_path, 'content': (
+                'package org.koin\nimport org.junit.Test\nimport org.junit.Assert.assertEquals\n'
+                + f'class {regression_test_name(identity)[:-3]} {{\n'
+                + '    @Test fun repairedValue() { assertEquals(2, Thing().value()) }\n}\n'
+            )},
+        ],
+    }
+
+    class CheckedOutGithub(Github):
+        def rest(self, method, path, *args, **kwargs):
+            if method == 'GET' and path == '/repos/BCSDLab/KOIN_ANDROID':
+                return {'private': not public}
+            return super().rest(method, path, *args, **kwargs)
+
+        def checkout(self, _sha, destination):
+            source = destination / SOURCE_PATH
+            source.parent.mkdir(parents=True)
+            source.write_text(source_before)
+
+    class Sandbox:
+        def __init__(self, **kwargs):
+            self.artifact_directory = kwargs['target'].parent / 'artifacts'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def export_artifacts(self, destination):
+            shutil.copytree(self.artifact_directory, destination, dirs_exist_ok=True)
+
+        def verify_candidate(self, **_kwargs):
+            raise AssertionError('conflicting metadata must block verification/publication')
+
+    class ConflictingQueue(Queue):
+        def save_proposal(self, *_args, **_kwargs):
+            raise JobConflict('another writer advanced the case')
+
+    queue = ConflictingQueue()
+    _patch_queue(monkeypatch, queue)
+    model_calls = []
+    monkeypatch.setattr(issues, 'verify_crash_issue', lambda *_a, **_k: None)
+    monkeypatch.setattr(issues, 'record_fix_progress', lambda *_a, **_k: None)
+    monkeypatch.setattr('crashlytics_automation.fix_generation.existing_fix', lambda *_a, **_k: None)
+    monkeypatch.setattr('crashlytics_automation.release_source.resolve_release_commit', lambda *_a, **_k: RELEASE_SHA)
+    monkeypatch.setattr('crashlytics_automation.pull_requests.branch_head_sha', lambda *_a, **_k: BASE_SHA)
+    monkeypatch.setattr('crashlytics_automation.sandbox.InvestigationSandbox', Sandbox)
+    monkeypatch.setattr('crashlytics_automation.openai_client.request_fix_proposal',
+                        lambda **_kwargs: model_calls.append(True) or decision)
+    monkeypatch.setenv('CRASHLYTICS_OPENAI_API_KEY', 'test-only')
+    artifacts = tmp_path / 'uploaded'
+    monkeypatch.setenv('INVESTIGATION_ARTIFACTS', str(artifacts))
+    job = _base_job()
+
+    assert worker.run_job(CheckedOutGithub(), {'botLogin': 'autofix[bot]'}, job) == {
+        'outcome': 'superseded', 'issueNumber': 17,
+    }
+    assert model_calls == [True]
+    recovery = artifacts / job['id'] / 'production' / 'proposal.json'
+    if public:
+        saved = json.loads(recovery.read_text())
+        assert saved['identity'] == {
+            'jobId': job['id'], 'target': 'production', 'releaseSha': RELEASE_SHA,
+            'branchBaseSha': BASE_SHA, 'baseSha': BASE_SHA,
+        }
+        recovered_files = {item['path']: item['content'] for item in saved['proposal']['files']}
+        assert recovered_files == {item['path']: item['content'] for item in decision['files']}
+    else:
+        assert not artifacts.exists()
