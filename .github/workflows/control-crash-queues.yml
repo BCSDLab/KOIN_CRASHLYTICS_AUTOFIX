@@ -1,0 +1,84 @@
+name: Control crash task queues
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Resume only after the state-storage cutover is verified
+        type: choice
+        options: [status, pause, resume]
+        default: status
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  control:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      CRASHLYTICS_ENV: ${{ secrets.CRASHLYTICS_ENV }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+      - name: Install trusted maintenance dependencies
+        run: python -m pip install --disable-pip-version-check --require-hashes -r requirements.txt
+      - uses: google-github-actions/auth@v3
+        with:
+          credentials_json: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+      - name: Control dispatch without querying crash data
+        env:
+          OPERATION: ${{ inputs.operation }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import google.auth
+          from google.auth.transport.requests import AuthorizedSession
+          from crashlytics_automation.worker import runtime_config
+
+          config = runtime_config()
+          credentials, project = google.auth.default(scopes=['https://www.googleapis.com/auth/cloud-platform'])
+          if project != config['projectId']:
+              raise ValueError('Maintenance credentials and configured project differ')
+          session = AuthorizedSession(credentials)
+          operation = os.environ['OPERATION']
+          if operation not in ('status', 'pause', 'resume'):
+              raise ValueError('Unsupported queue operation')
+          for queue in ('generateCrashlyticsFix', 'mergeCrashlyticsFix'):
+              url = 'https://cloudtasks.googleapis.com/v2/projects/' + project + '/locations/us-central1/queues/' + queue
+              response = session.get(url, timeout=30, allow_redirects=False)
+              response.raise_for_status()
+              state = response.json()['state']
+              desired = {'pause': 'PAUSED', 'resume': 'RUNNING'}.get(operation)
+              if desired and state != desired:
+                  response = session.post(url + ':' + operation, json={}, timeout=30, allow_redirects=False)
+                  response.raise_for_status()
+                  state = response.json()['state']
+                  if state != desired:
+                      raise RuntimeError('Queue did not reach the requested state')
+              print(json.dumps({'queue': queue, 'state': state}), flush=True)
+              pending = 0
+              inflight = 0
+              token = None
+              while True:
+                  params = {'pageSize': 1000, 'responseView': 'BASIC'}
+                  if token:
+                      params['pageToken'] = token
+                  response = session.get(url + '/tasks', params=params, timeout=30, allow_redirects=False)
+                  response.raise_for_status()
+                  payload = response.json()
+                  tasks = payload.get('tasks', [])
+                  pending += len(tasks)
+                  inflight += sum(task.get('dispatchCount', 0) > task.get('responseCount', 0) for task in tasks)
+                  token = payload.get('nextPageToken')
+                  if not token:
+                      break
+              print(json.dumps({'queue': queue, 'pendingTasks': pending, 'inflightTasks': inflight}), flush=True)
+          PY
