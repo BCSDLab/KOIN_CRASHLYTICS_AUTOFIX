@@ -78,8 +78,6 @@ def validate_job(job: Any) -> None:
         raise ValueError('Invalid investigation proposal pointer')
     if 'verificationOnly' in job and type(job['verificationOnly']) is not bool:
         raise ValueError('Invalid verification-only state')
-    if 'verificationResumeRequired' in job and type(job['verificationResumeRequired']) is not bool:
-        raise ValueError('Invalid verification resume state')
     limits = job.get('attemptLimits', {})
     if (
         not isinstance(limits, dict) or not set(limits).issubset(TARGET_BRANCHES)
@@ -449,6 +447,7 @@ class InvestigationQueue:
         return sha
 
     def put(self, job: dict[str, Any]) -> None:
+        job.pop('verificationResumeRequired', None)
         validate_job(job)
         payload = {key: value for key, value in job.items() if key != '_blobSha'}
         raw = json.dumps(payload, ensure_ascii=False, separators=(',', ':'), allow_nan=False).encode()

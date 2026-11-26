@@ -141,10 +141,7 @@ def prepare_existing_issue(
             if job['attempts'].get(target, 0) != DEFAULT_ATTEMPT_LIMIT:
                 raise ValueError('Only one additional attempt after the default limit may be approved')
             job.setdefault('attemptLimits', {})[target] = APPROVED_ATTEMPT_LIMIT
-        job['status'] = 'queued'
-        job.pop('reason', None)
-        job.pop('reportPending', None)
-        job['verificationResumeRequired'] = False
+        job.pop('verificationResumeRequired', None)
         if verification_only:
             job['verificationOnly'] = True
         changed = True
@@ -283,6 +280,13 @@ def run_job(github: Any, config: dict[str, Any], job: dict[str, Any]) -> dict[st
 
     queue = InvestigationQueue(github)
     context = _context(job)
+    if job.get('status') == 'manual':
+        if job.get('reportPending') is True:
+            job.pop('verificationResumeRequired', None)
+            return _report(github, queue, job, config) or {
+                'outcome': 'manual', 'issueNumber': context.issue_number,
+            }
+        return {'outcome': 'manual', 'issueNumber': context.issue_number}
     if job.get('verificationOnly') is True or os.environ.get('CRASHLYTICS_VERIFICATION_ONLY') == '1':
         os.environ.pop('CRASHLYTICS_OPENAI_API_KEY', None)
     verify_crash_issue(github, context)
@@ -300,8 +304,7 @@ def run_job(github: Any, config: dict[str, Any], job: dict[str, Any]) -> dict[st
             return result or {'outcome': job['status'], 'issueNumber': context.issue_number}
         if target is None:
             return _deliver(github, queue, job, config)
-        if job.get('verificationResumeRequired') is True:
-            raise RuntimeError('An explicit resume is required before retrying trusted verification')
+        job.pop('verificationResumeRequired', None)
         attempts = job['attempts'].get(target, 0)
         job['status'] = 'running'
         job['startedAt'] = datetime.now(timezone.utc).isoformat()
@@ -495,15 +498,23 @@ def run_job(github: Any, config: dict[str, Any], job: dict[str, Any]) -> dict[st
                     retries = job.setdefault('verificationAttempts', {}).get(target, 0)
                     if retries >= MAX_VERIFICATION_ATTEMPTS:
                         raise RuntimeError('The trusted verification retry limit was reached')
-                    job['verificationResumeRequired'] = True
                     job['verificationAttempts'][target] = retries + 1
                     queue.put(job)
                     verification = sandbox.verify_candidate(files=validated['files'], identity_hash=identity_hash)
                     job['analyses'][target]['verification'] = {
                         'passed': verification.get('passed') is True, 'reason': str(verification.get('reason', ''))[:2000],
+                        'retryable': verification.get('retryable') is True,
                     }
                     if verification.get('passed') is not True:
-                        raise ValueError(verification.get('reason') or 'Independent reproduction verification failed')
+                        reason = verification.get('reason') or 'Independent reproduction verification failed'
+                        if verification.get('retryable') is True and retries + 1 < MAX_VERIFICATION_ATTEMPTS:
+                            job['status'], job['reason'] = 'queued', _redact_secrets(str(reason))
+                            queue.put(job)
+                            _report(github, queue, job, config)
+                            return {'outcome': 'queued', 'issueNumber': context.issue_number,
+                                    'baseBranch': target, 'verificationRetry': retries + 1}
+                        raise ValueError(reason)
+                    job.pop('verificationResumeRequired', None)
                     source = resolve_investigated_source(github, release_sha=release,
                                                         path=decision['sourcePath'], line=decision['sourceLine'])
                     if isinstance(source, ManualReview):
@@ -521,7 +532,7 @@ def run_job(github: Any, config: dict[str, Any], job: dict[str, Any]) -> dict[st
                     )
                     if isinstance(published, ManualReview):
                         raise ValueError(published.reason)
-                    job['verificationResumeRequired'] = False
+                    job.pop('verificationResumeRequired', None)
                     job['branches'][target] = published.to_payload()
                     job['status'] = 'queued' if len(job['branches']) < len(TARGET_BRANCHES) else 'delivering'
                     queue.put(job)
@@ -571,7 +582,7 @@ def run_job(github: Any, config: dict[str, Any], job: dict[str, Any]) -> dict[st
                 return {'outcome': 'superseded', 'issueNumber': context.issue_number}
             _report(github, queue, job, config)
             return {'outcome': 'delivering', 'issueNumber': context.issue_number}
-        job['status'], job['reason'], job['reportPending'] = 'manual', reason, True
+        job.pop('verificationResumeRequired', None)
         try:
             queue.put(job)
         except JobConflict:
@@ -623,11 +634,11 @@ def main() -> int:
             )
             if prepared['status'] == 'queued':
                 jobs = [prepared]
-    if arguments.verification_only and jobs:
-        if jobs[0].get('verificationOnly') is not True or jobs[0].get('verificationResumeRequired') is not False:
-            jobs[0]['verificationOnly'] = True
-            jobs[0]['verificationResumeRequired'] = False
-            queue.put(jobs[0])
+        if arguments.verification_only and jobs:
+            if jobs[0].get('verificationOnly') is not True:
+                jobs[0]['verificationOnly'] = True
+                jobs[0].pop('verificationResumeRequired', None)
+                queue.put(jobs[0])
     if arguments.verification_only and jobs:
         target = next((branch for branch in TARGET_BRANCHES if branch not in jobs[0]['branches']), None)
         saved_proposal = target is not None and queue.get_proposal(jobs[0], target) is not None

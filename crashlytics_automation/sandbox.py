@@ -401,14 +401,20 @@ class InvestigationSandbox:
             for module in unit_tests:
                 remaining = _remaining_timeout(deadline, 300)
                 if not remaining:
-                    return {'passed': False, 'reason': 'verification time budget exhausted during task discovery', 'checks': checks}
+                    return {'passed': False, 'retryable': True,
+                            'reason': 'verification time budget exhausted during task discovery', 'checks': checks}
                 module_task = ':'.join(module.parts)
                 listing = self._run(verifier, f'./gradlew --no-daemon :{module_task}:tasks --all', remaining)
                 task = _unit_test_task(listing['stdout'], module_task)
                 if task is None or listing['exit_code'] != 0 or listing['timed_out']:
+                    retryable = (
+                        listing['timed_out'] or listing['exit_code'] == 124
+                        or _container_liveness_failure(listing)
+                    )
                     checks.append({'phase': 'task-discovery', 'module': module.as_posix(),
                                    'exit_code': listing['exit_code'], 'timed_out': listing['timed_out']})
-                    return {'passed': False, 'reason': 'trusted base build exposes no usable unit-test task', 'checks': checks}
+                    return {'passed': False, 'retryable': retryable,
+                            'reason': 'trusted base build exposes no usable unit-test task', 'checks': checks}
                 unit_tasks[module] = task
 
             baseline_unit: dict[pathlib.PurePosixPath, dict[str, Any]] = {}
@@ -420,7 +426,8 @@ class InvestigationSandbox:
                 else:
                     remaining = _remaining_timeout(deadline, 900)
                     if not remaining:
-                        return {'passed': False, 'reason': 'verification time budget exhausted before baseline', 'checks': checks}
+                        return {'passed': False, 'retryable': True,
+                                'reason': 'verification time budget exhausted before baseline', 'checks': checks}
                     if instrumented:
                         module_task = ':'.join(module.parts)
                         task = f':{module_task}:connectedDebugAndroidTest'
@@ -442,7 +449,17 @@ class InvestigationSandbox:
                             'exit_code': baseline['exit_code'], 'timed_out': baseline['timed_out'],
                             'test_result': 'setup-failure', 'evidence': None,
                         })
-                        return {'passed': False, 'reason': 'trusted Android instrumentation setup failed', 'checks': checks}
+                        return {'passed': False, 'retryable': True,
+                                'reason': 'trusted Android instrumentation setup failed', 'checks': checks}
+                    if baseline['timed_out']:
+                        checks.append({'phase': 'baseline', 'path': test['path'].as_posix(),
+                                       'exit_code': baseline['exit_code'], 'timed_out': True,
+                                       'test_result': 'timeout', 'evidence': None})
+                        return {'passed': False, 'retryable': True,
+                                'reason': 'trusted verification command timed out during baseline', 'checks': checks}
+                    if _container_liveness_failure(baseline):
+                        return {'passed': False, 'retryable': True,
+                                'reason': 'verification container became unavailable during baseline', 'checks': checks}
                     if not instrumented:
                         baseline_unit[module] = baseline
                 task = (':'.join(module.parts) + ':connectedDebugAndroidTest'
@@ -454,7 +471,6 @@ class InvestigationSandbox:
                     workspace, module, test['class'], scratch / f'baseline-{index}.logcat.txt',
                     baseline['stdout'] + '\n' + baseline['stderr'],
                 ) if instrumented and not baseline['timed_out'] else None
-                reproduced = baseline['exit_code'] != 0 and not baseline['timed_out'] and (xml_failure or oom is not None)
                 checks.append({
                     'phase': 'baseline', 'path': test['path'].as_posix(),
                     'exit_code': baseline['exit_code'], 'timed_out': baseline['timed_out'],
@@ -462,7 +478,7 @@ class InvestigationSandbox:
                     'evidence': oom if oom else {'source': 'junit-xml'} if xml_failure else None,
                 })
                 if not reproduced:
-                    return {'passed': False,
+                    return {'passed': False, 'retryable': False,
                             'reason': 'baseline did not reproduce the regression in JUnit XML or trusted Android OOM logs',
                             'checks': checks}
 
@@ -478,7 +494,8 @@ class InvestigationSandbox:
                 else:
                     remaining = _remaining_timeout(deadline, 900)
                     if not remaining:
-                        return {'passed': False, 'reason': 'verification time budget exhausted before candidate run', 'checks': checks}
+                        return {'passed': False, 'retryable': True,
+                                'reason': 'verification time budget exhausted before candidate run', 'checks': checks}
                     if instrumented:
                         module_task = ':'.join(module.parts)
                         task = f':{module_task}:connectedDebugAndroidTest'
@@ -500,7 +517,17 @@ class InvestigationSandbox:
                             'exit_code': after['exit_code'], 'timed_out': after['timed_out'],
                             'test_result': 'setup-failure', 'evidence': None,
                         })
-                        return {'passed': False, 'reason': 'trusted Android instrumentation setup failed', 'checks': checks}
+                        return {'passed': False, 'retryable': True,
+                                'reason': 'trusted Android instrumentation setup failed', 'checks': checks}
+                    if after['timed_out']:
+                        checks.append({'phase': 'candidate', 'path': test['path'].as_posix(),
+                                       'exit_code': after['exit_code'], 'timed_out': True,
+                                       'test_result': 'timeout', 'evidence': None})
+                        return {'passed': False, 'retryable': True,
+                                'reason': 'trusted verification command timed out during candidate run', 'checks': checks}
+                    if _container_liveness_failure(after):
+                        return {'passed': False, 'retryable': True,
+                                'reason': 'verification container became unavailable during candidate run', 'checks': checks}
                     if not instrumented:
                         candidate_unit[module] = after
                 task = (':'.join(module.parts) + ':connectedDebugAndroidTest'
@@ -520,11 +547,15 @@ class InvestigationSandbox:
                     'evidence': {'source': 'junit-xml'} if passed else oom,
                 })
                 all_passed = all_passed and passed
-            return {'passed': all_passed,
+            return {'passed': all_passed, 'retryable': False,
                     'reason': 'all regressions reproduced and passed with candidate' if all_passed else 'candidate did not pass every reproduced regression',
                     'checks': checks}
+        except RuntimeError as exc:
+            if str(exc).startswith(('could not start investigation container:', 'could not stop owned investigation container:')):
+                return {'passed': False, 'retryable': True, 'reason': str(exc)[:300], 'checks': checks}
+            raise
         except (OSError, ValueError, TypeError, ET.ParseError) as exc:
-            return {'passed': False, 'reason': str(exc)[:300], 'checks': checks}
+            return {'passed': False, 'retryable': False, 'reason': str(exc)[:300], 'checks': checks}
         finally:
             if verifier is not None:
                 self._stop_container(verifier)
@@ -628,6 +659,19 @@ def _instrumentation_setup_failure(result: dict[str, Any]) -> bool:
     return 'VERIFICATION_SETUP_FAILURE:' in (result.get('stdout', '') + result.get('stderr', ''))
 
 
+
+def _container_liveness_failure(result: dict[str, Any]) -> bool:
+    stderr = result.get('stderr', '')
+    if not isinstance(stderr, str):
+        return False
+    lowered = stderr.lower()
+    return any(marker in lowered for marker in (
+        'error response from daemon: container ',
+        'error response from daemon: no such container',
+        'cannot connect to the docker daemon',
+        'error during connect:',
+    ))
+
 def _instrumentation_command(task: str, test_class: str, log_name: str) -> str:
     class_filter = shlex.quote(test_class)
     log_path = shlex.quote(f'/workspace/scratch/{log_name}')
@@ -638,7 +682,7 @@ mkdir -p "$HOME/.android/avd" "$SCRATCH"
 fail_setup() {{ echo "VERIFICATION_SETUP_FAILURE: $*" >&2; exit 70; }}
 echo no | avdmanager create avd --force --name crashlytics-verification --package "system-images;android-34;google_apis;x86_64" --device pixel_2 >"$SCRATCH/avdmanager.log" 2>&1 || fail_setup "AVD creation failed"
 test -s "$HOME/.android/avd/crashlytics-verification.avd/config.ini" || fail_setup "AVD configuration missing"
-./gradlew {_INSTRUMENTATION_GRADLE_ARGS} :{module_task}:assembleDebug :{module_task}:assembleDebugAndroidTest || fail_setup "pristine instrumentation APK build failed"
+./gradlew {_INSTRUMENTATION_GRADLE_ARGS} :{module_task}:assembleDebug :{module_task}:assembleDebugAndroidTest
 emulator -avd crashlytics-verification -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect -no-snapshot -wipe-data -memory 1536 -cores 2 >"$SCRATCH/emulator.log" 2>&1 &
 EMULATOR_PID=$!
 trap 'kill "$EMULATOR_PID" 2>/dev/null || true; wait "$EMULATOR_PID" 2>/dev/null || true' EXIT

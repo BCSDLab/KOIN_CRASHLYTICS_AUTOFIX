@@ -68,12 +68,73 @@ def test_compile_error_does_not_count_as_baseline_reproduction(tmp_path: Path) -
     finally:
         sandbox.close()
 
-    assert result['passed'] is False
     assert result['reason'] == 'baseline did not reproduce the regression in JUnit XML or trusted Android OOM logs'
+    assert result['retryable'] is False
     assert result['checks'][0]['test_result'] == 'missing-or-not-failing'
     assert len(calls) == 2  # task discovery, then failed test execution
 
 
+
+def test_android_setup_marker_is_retryable_in_structured_verification(tmp_path: Path) -> None:
+    sandbox = _sandbox(tmp_path)
+    sandbox._new_container = lambda *_args: 'fake-container'  # type: ignore[method-assign]
+    sandbox._stop_container = lambda *_args: None  # type: ignore[method-assign]
+    calls = []
+
+    def setup_failure(_container: str, command: str, _timeout: int) -> dict[str, object]:
+        calls.append(command)
+        return {
+            'exit_code': 70,
+            'stdout': '',
+            'stderr': 'VERIFICATION_SETUP_FAILURE: emulator readiness timed out',
+            'timed_out': False,
+        }
+
+    sandbox._run = setup_failure  # type: ignore[method-assign]
+    test_path = f'domain/src/androidTest/kotlin/example/{regression_test_name(IDENTITY)}'
+    try:
+        result = sandbox.verify_candidate(
+            files=[
+                {'path': test_path, 'content': 'package example\nclass Regression'},
+                {'path': 'domain/src/main/kotlin/example/Subject.kt', 'content': 'class Subject'},
+            ],
+            identity_hash=IDENTITY,
+        )
+    finally:
+        sandbox.close()
+
+    assert result['passed'] is False
+    assert result['retryable'] is True
+    assert result['checks'][0]['test_result'] == 'setup-failure'
+    assert 'assembleDebug' in calls[0]
+    assert 'VERIFICATION_SETUP_FAILURE:' not in calls[0]
+
+
+def test_host_command_timeout_is_retryable(tmp_path: Path) -> None:
+    sandbox = _sandbox(tmp_path)
+    sandbox._new_container = lambda *_args: 'fake-container'  # type: ignore[method-assign]
+    sandbox._stop_container = lambda *_args: None  # type: ignore[method-assign]
+    calls = []
+
+    def timed_out(_container: str, command: str, _timeout: int) -> dict[str, object]:
+        calls.append(command)
+        if command.endswith(':tasks --all'):
+            return {'exit_code': 0, 'stdout': 'testDebugUnitTest - Runs unit tests\n',
+                    'stderr': '', 'timed_out': False}
+        return {'exit_code': None, 'stdout': '', 'stderr': '', 'timed_out': True}
+
+    sandbox._run = timed_out  # type: ignore[method-assign]
+    try:
+        result = sandbox.verify_candidate(
+            files=_candidate(f'domain/src/test/kotlin/example/{regression_test_name(IDENTITY)}'),
+            identity_hash=IDENTITY,
+        )
+    finally:
+        sandbox.close()
+
+    assert result['passed'] is False
+    assert result['retryable'] is True
+    assert result['checks'][-1]['test_result'] == 'timeout'
 def test_sandbox_keeps_host_checkout_untouched_and_sanitizes_secrets(tmp_path: Path) -> None:
     target = tmp_path / 'target'
     release = tmp_path / 'release'

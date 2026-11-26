@@ -269,6 +269,18 @@ def test_manual_hold_redelivery_does_not_dispatch_or_change_job_counters():
     assert after["attempts"] == before["attempts"]
     assert after["deliveryAttempts"] == before["deliveryAttempts"]
 
+
+def test_obsolete_verification_resume_key_is_discarded_on_job_write():
+    github = MemoryGitHub()
+    queue = InvestigationQueue(github)
+    job = new_job(service_context_alert(), {'status': 'ready'}, 17)
+    job['verificationResumeRequired'] = False
+
+    queue.put(job)
+    saved = queue.get(service_context_alert())
+
+    assert 'verificationResumeRequired' not in saved
+
 def service_context_alert():
     from crashlytics_automation.task_payloads import parse_alert_payload
 

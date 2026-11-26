@@ -219,6 +219,8 @@ def test_failed_trusted_verification_reports_analysis_without_publishing(monkeyp
                 source_file.parent.mkdir(parents=True, exist_ok=True)
                 source_file.write_text(source_before, encoding='utf-8')
 
+    verify_calls = []
+
     class FailedVerificationSandbox:
         def __init__(self, **kwargs):
             self.artifact_directory = kwargs['target'].parent / 'artifacts'
@@ -233,6 +235,7 @@ def test_failed_trusted_verification_reports_analysis_without_publishing(monkeyp
             raise AssertionError('provider output is already stubbed')
 
         def verify_candidate(self, **_kwargs):
+            verify_calls.append(True)
             assert target in queue.proposals
             return {'passed': False, 'reason': 'Regression test passed before the fix.'}
     queue = Queue()
@@ -266,7 +269,7 @@ def test_failed_trusted_verification_reports_analysis_without_publishing(monkeyp
     assert queue.latest['status'] == 'manual'
     assert queue.latest['analyses'][target]['analysis'] == decision['analysis']
     assert queue.latest['analyses'][target]['verification'] == {
-        'passed': False, 'reason': 'Regression test passed before the fix.',
+        'passed': False, 'reason': 'Regression test passed before the fix.', 'retryable': False,
     }
     assert reports and reports[0][1] == 'Regression test passed before the fix.'
     assert reports[0][0].evidence['investigation']['analyses'][target]['analysis'] == decision['analysis']
@@ -274,7 +277,6 @@ def test_failed_trusted_verification_reports_analysis_without_publishing(monkeyp
     assert target in queue.latest['proposals']
 
     resumed = copy.deepcopy(queue.latest)
-    resumed['verificationResumeRequired'] = False
     resumed['status'] = 'queued'
     resumed.pop('reportPending', None)
     resumed.pop('reason', None)
@@ -291,8 +293,6 @@ def test_failed_trusted_verification_reports_analysis_without_publishing(monkeyp
     assert queue.latest['verificationAttempts'][target] == 2
 
     stale = copy.deepcopy(queue.latest)
-    stale['status'] = 'queued'
-    stale['verificationResumeRequired'] = False
     stale['branchBases'][target] = '8' * 40
     queue.put(stale)
     worker.run_job(CheckedOutGithub(), {'botLogin': 'autofix[bot]'}, copy.deepcopy(queue.latest))
@@ -300,15 +300,135 @@ def test_failed_trusted_verification_reports_analysis_without_publishing(monkeyp
     assert queue.latest['verificationAttempts'][target] == 2
 
     capped = copy.deepcopy(queue.latest)
-    capped['status'] = 'queued'
-    capped['verificationResumeRequired'] = False
     capped['branchBases'][target] = BASE_SHA
     capped['verificationAttempts'][target] = 3
     queue.put(capped)
     worker.run_job(CheckedOutGithub(), {'botLogin': 'autofix[bot]'}, copy.deepcopy(queue.latest))
     assert queue.latest['verificationAttempts'][target] == 3
+    assert len(verify_calls) == 2
 
 
+
+def test_held_manual_job_with_both_publications_never_delivers(monkeypatch):
+    from crashlytics_automation import issues
+
+    queue = Queue()
+    _patch_queue(monkeypatch, queue)
+    job = _base_job('manual')
+    job['reason'] = 'Held for human review'
+    job['branches'] = {
+        branch: _fix(branch, number).to_payload()
+        for branch, number in (('production', 1793), ('develop', 1794))
+    }
+    job['sources'] = {branch: _source() for branch in job['branches']}
+    job['branchBases'] = {branch: BASE_SHA for branch in job['branches']}
+    job['reportPending'] = False
+    forbidden = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError('held job was reopened'))
+    monkeypatch.setattr(issues, 'verify_crash_issue', forbidden)
+    monkeypatch.setattr('crashlytics_automation.openai_client.request_fix_proposal', forbidden)
+    monkeypatch.setattr('crashlytics_automation.fix_generation.publish_investigated_fix', forbidden)
+    monkeypatch.setattr(worker, 'enqueue_task', forbidden)
+    queue.latest = copy.deepcopy(job)
+
+    result = worker.run_job(Github(), {'botLogin': 'autofix[bot]'}, copy.deepcopy(job))
+
+    assert result == {'outcome': 'manual', 'issueNumber': 17}
+    assert queue.latest == job
+
+
+def test_retryable_verification_uses_checkpoint_without_model_recall(monkeypatch):
+    from crashlytics_automation import issues
+
+    identity = identity_hash_for(ALERT.issue_id, RELEASE_SHA)
+    test_path = f'domain/src/test/kotlin/org/koin/{regression_test_name(identity)}'
+    source_before = 'package org.koin\nclass Thing { fun value() = 1 }\n'
+    decision = {
+        'decision': 'fix',
+        'analysis': 'Observed behavior.',
+        'reason': 'Reproduced by the regression test.',
+        'sourcePath': SOURCE_PATH,
+        'sourceLine': 2,
+        'files': [
+            {'path': SOURCE_PATH, 'content': 'package org.koin\nclass Thing { fun value() = 2 }\n'},
+            {'path': test_path, 'content': (
+                'package org.koin\nimport org.junit.Test\nimport org.junit.Assert.assertTrue\n'
+                + f'class {regression_test_name(identity)[:-3]} {{\n'
+                + '    @Test fun valueIsPositive() { assertTrue(Thing().value() > 0) }\n}\n'
+            )},
+        ],
+    }
+
+    class CheckedOutGithub(Github):
+        def checkout(self, sha, destination):
+            destination.mkdir(parents=True, exist_ok=True)
+            if sha == BASE_SHA:
+                source = destination / SOURCE_PATH
+                source.parent.mkdir(parents=True, exist_ok=True)
+                source.write_text(source_before, encoding='utf-8')
+
+    verification_results = [
+        {'passed': False, 'retryable': True, 'reason': 'verification command timed out'},
+        {'passed': True, 'reason': 'all regressions reproduced and passed with candidate'},
+    ]
+    seen_candidates = []
+
+    class RetrySandbox:
+        def __init__(self, **kwargs):
+            self.artifact_directory = kwargs['target'].parent / 'artifacts'
+            self.artifact_directory.mkdir(exist_ok=True)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, **_kwargs):
+            raise AssertionError('provider proposal is stubbed')
+
+        def verify_candidate(self, *, files, **_kwargs):
+            seen_candidates.append(copy.deepcopy(files))
+            return verification_results.pop(0)
+
+    queue = Queue()
+    _patch_queue(monkeypatch, queue)
+    model_calls = []
+    publications = []
+    monkeypatch.setattr(issues, 'verify_crash_issue', lambda *_a, **_k: None)
+    monkeypatch.setattr(issues, 'record_fix_progress', lambda *_a, **_k: None)
+    monkeypatch.setattr(issues, 'report_for_human',
+                        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError('infra retry held for human')))
+    monkeypatch.setattr('crashlytics_automation.fix_generation.existing_fix', lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        'crashlytics_automation.fix_generation.publish_investigated_fix',
+        lambda **_kwargs: publications.append(True) or _fix('production', 24),
+    )
+    monkeypatch.setattr('crashlytics_automation.release_source.resolve_release_commit',
+                        lambda *_a, **_k: RELEASE_SHA)
+    monkeypatch.setattr('crashlytics_automation.release_source.resolve_investigated_source',
+                        lambda **_kwargs: _source())
+    monkeypatch.setattr('crashlytics_automation.pull_requests.branch_head_sha',
+                        lambda _g, branch: BASE_SHA if branch == 'production' else '9' * 40)
+    monkeypatch.setattr('crashlytics_automation.openai_client.request_fix_proposal',
+                        lambda **_kwargs: model_calls.append(True) or decision)
+    monkeypatch.setattr('crashlytics_automation.sandbox.InvestigationSandbox', RetrySandbox)
+    monkeypatch.setenv('CRASHLYTICS_OPENAI_API_KEY', 'test-only')
+
+    first = worker.run_job(CheckedOutGithub(), {'botLogin': 'autofix[bot]'}, _base_job())
+    first_checkpoint = copy.deepcopy(queue.proposals['production'])
+    interrupted = copy.deepcopy(queue.latest)
+    interrupted['status'] = 'running'
+    queue.put(interrupted)
+    second = worker.run_job(CheckedOutGithub(), {'botLogin': 'autofix[bot]'}, copy.deepcopy(queue.latest))
+
+    assert first['outcome'] == 'queued'
+    assert queue.latest['verificationAttempts']['production'] == 2
+    assert first_checkpoint == queue.proposals['production']
+    assert len(model_calls) == 1
+    assert seen_candidates[0] == seen_candidates[1]
+    assert second == {'outcome': 'queued', 'issueNumber': 17, 'baseBranch': 'production', 'pullNumber': 24}
+    assert queue.latest['branches']['production']['pullNumber'] == 24
+    assert len(publications) == 1
 @pytest.mark.parametrize('prior_attempts', [0, 3])
 def test_interrupted_provider_failure_keeps_incremental_trace_and_retries_only_pending_report(monkeypatch, tmp_path, prior_attempts):
     from crashlytics_automation import issues
