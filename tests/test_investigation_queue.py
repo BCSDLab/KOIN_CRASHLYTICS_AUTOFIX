@@ -197,7 +197,11 @@ class MemoryBigQuery:
 def test_library_only_evidence_is_enqueued_once_and_reused_without_bigquery():
     github = MemoryGitHub()
     bigquery = MemoryBigQuery()
-    service = CrashAutomation(github, CONFIG, bigquery_client=bigquery)
+    dispatches = []
+    service = CrashAutomation(
+        github, CONFIG, bigquery_client=bigquery,
+        worker_dispatch=lambda: dispatches.append(None),
+    )
     task = {"alert": ALERT}
 
     first = service.process_fix_task(task)
@@ -206,12 +210,64 @@ def test_library_only_evidence_is_enqueued_once_and_reused_without_bigquery():
     assert first["outcome"] == second["outcome"] == "queued"
     assert first["investigationId"] == second["investigationId"]
     assert bigquery.query_count == 1
+    assert len(dispatches) == 2
     job = InvestigationQueue(github).get(service_context_alert())
     assert job["status"] == "queued"
     assert job["evidence"]["frame"] is None
     assert job["evidence"]["stackTrace"]["exceptions"][0]["type"] == "java.lang.OutOfMemoryError"
     assert github.refs and not any(ref.startswith("refs/heads/") for ref in github.refs)
 
+
+def test_dispatch_failure_after_persistence_retries_without_requerying_evidence():
+    github = MemoryGitHub()
+    bigquery = MemoryBigQuery()
+    dispatches = []
+
+    def dispatch():
+        dispatches.append(None)
+        if len(dispatches) == 1:
+            raise RuntimeError("GitHub dispatch unavailable")
+
+    service = CrashAutomation(
+        github, CONFIG, bigquery_client=bigquery, worker_dispatch=dispatch,
+    )
+    task = {"alert": ALERT}
+
+    with pytest.raises(RuntimeError, match="GitHub dispatch unavailable"):
+        service.process_fix_task(task)
+    result = service.process_fix_task(task)
+
+    assert result["outcome"] == "queued"
+    assert bigquery.query_count == 1
+    assert len(dispatches) == 2
+    assert InvestigationQueue(github).get(service_context_alert())["status"] == "queued"
+
+
+def test_manual_hold_redelivery_does_not_dispatch_or_change_job_counters():
+    github = MemoryGitHub()
+    alert = service_context_alert()
+    job = new_job(alert, {"status": "ready"}, 17)
+    job["status"] = "manual"
+    job["reason"] = "Human review required"
+    job["attempts"] = {"production": 2}
+    job["deliveryAttempts"] = 3
+    queue = InvestigationQueue(github)
+    queue.put(job)
+    before = queue.get(alert)
+    dispatches = []
+    service = CrashAutomation(
+        github, CONFIG, bigquery_client=MemoryBigQuery(),
+        worker_dispatch=lambda: dispatches.append(None),
+    )
+
+    result = service.process_fix_task({"alert": ALERT})
+    after = queue.get(alert)
+
+    assert result["outcome"] == "manual"
+    assert dispatches == []
+    assert after["status"] == before["status"] == "manual"
+    assert after["attempts"] == before["attempts"]
+    assert after["deliveryAttempts"] == before["deliveryAttempts"]
 
 def service_context_alert():
     from crashlytics_automation.task_payloads import parse_alert_payload
@@ -232,7 +288,10 @@ def test_legacy_human_only_marker_does_not_block_investigation():
     }
     github = MemoryGitHub([fixture])
     bigquery = MemoryBigQuery()
-    result = CrashAutomation(github, CONFIG, bigquery_client=bigquery).process_fix_task({"alert": ALERT})
+    result = CrashAutomation(
+        github, CONFIG, bigquery_client=bigquery,
+        worker_dispatch=lambda: None,
+    ).process_fix_task({"alert": ALERT})
 
     assert result["outcome"] == "queued"
     assert bigquery.query_count == 1

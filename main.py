@@ -16,7 +16,12 @@ from google.cloud import bigquery
 from crashlytics_automation.github import create_github
 from crashlytics_automation.service import CrashAutomation
 from crashlytics_automation.task_payloads import MAX_FIX_RETRIES, MAX_MERGE_RETRIES, parse_firebase_alert
-from crashlytics_automation.repository import ANDROID_APPLICATION_ID
+from crashlytics_automation.repository import (
+    ANDROID_APPLICATION_ID,
+    AUTOMATION_DISPATCH_PATH,
+    AUTOMATION_REPOSITORY,
+    REPOSITORY,
+)
 
 
 def _required_env(name: str) -> str:
@@ -54,13 +59,22 @@ options.set_global_options(
 initialize_app(options={'projectId': PROJECT_ID})
 
 
-def _github(permissions: dict[str, str]) -> Any:
+def _github(permissions: dict[str, str], *, repository: str = REPOSITORY) -> Any:
     return create_github(
         _required_env('CRASHLYTICS_GITHUB_APP_ID'),
         _required_env('CRASHLYTICS_GITHUB_INSTALLATION_ID'),
         PRIVATE_KEY.value,
         permissions=permissions,
+        repository=repository,
     )
+
+
+def _dispatch_investigation_worker() -> None:
+    automation_github = _github(
+        {'actions': 'write'},
+        repository=AUTOMATION_REPOSITORY,
+    )
+    automation_github.rest('POST', AUTOMATION_DISPATCH_PATH, {'ref': 'main'})
 
 
 def _enqueue_task(name: str, identity: str, data: dict[str, Any]) -> None:
@@ -124,10 +138,14 @@ def crashlyticsVelocity(event: crashlytics_fn.CrashlyticsVelocityAlertEvent) -> 
 
 @tasks_fn.on_task_dispatched(**{**TASK_OPTIONS, 'secrets': [PRIVATE_KEY], 'timeout_sec': 600})
 def generateCrashlyticsFix(request: tasks_fn.CallableRequest) -> dict[str, Any]:
+    automation_github = _github(
+        {'contents': 'write', 'issues': 'write'},
+    )
     automation = CrashAutomation(
-        _github({'contents': 'write', 'issues': 'write'}),
+        automation_github,
         CONFIG,
         bigquery_client=bigquery.Client(project=PROJECT_ID),
+        worker_dispatch=_dispatch_investigation_worker,
     )
     return automation.process_fix_task(request.data, retry_count=_retry_count(request))
 
@@ -143,4 +161,3 @@ def mergeCrashlyticsFix(request: tasks_fn.CallableRequest) -> dict[str, Any]:
         _github({'contents': 'write', 'issues': 'write', 'pull_requests': 'write', 'checks': 'read', 'statuses': 'read'}),
         CONFIG,
     )
-    return automation.process_merge_task(request.data, retry_count=_retry_count(request))

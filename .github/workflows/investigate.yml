@@ -82,6 +82,9 @@ jobs:
 
   investigate:
     needs: prepare
+    permissions:
+      contents: read
+      actions: write
     if: ${{ !cancelled() && (needs.prepare.result == 'success' || needs.prepare.result == 'skipped') }}
     concurrency:
       group: crashlytics-investigation-worker
@@ -155,6 +158,7 @@ jobs:
           docker build --file "$GITHUB_WORKSPACE/Dockerfile.investigation" --tag "$INVESTIGATION_IMAGE" "$context"
 
       - name: Investigate, reproduce, verify and publish one target lane
+        id: execute
         if: steps.queue.outputs.pending == 'true'
         env:
           ISSUE_NUMBER: ${{ steps.queue.outputs.issue_number }}
@@ -167,6 +171,20 @@ jobs:
             args+=(--verification-only)
           fi
           python -m crashlytics_automation.worker "${args[@]}"
+
+      - name: Find work remaining after this target lane
+        if: success() && steps.execute.outcome == 'success'
+        id: remaining
+        run: python -m crashlytics_automation.worker --list-pending
+
+      - name: Continue queued investigations automatically
+        if: success() && steps.remaining.outputs.pending == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api --method POST \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/investigate.yml/dispatches" \
+            -f ref=main
 
       - name: Upload public-repository reproduction artifacts
         if: always() && steps.queue.outputs.pending == 'true'

@@ -1,8 +1,9 @@
-"""Scoped GitHub App transport for the crash automation.
+"""Explicitly isolated GitHub App transports for crash automation.
 
-Only application-owned endpoints under the fixed repository may be reached. Crash
-report contents never become an API destination, and provider error bodies are
-never surfaced because they can echo credentials.
+The application scope reaches application-owned endpoints under the fixed
+repository. The automation scope can only dispatch its trusted investigation
+workflow. Crash report contents never become an API destination, and provider
+error bodies are never surfaced because they can echo credentials.
 
 Installation tokens are minted on demand with a short-lived RS256 app JWT. The
 transport is a plain ``requests.Session`` (or an injected equivalent exposing
@@ -19,7 +20,15 @@ from typing import Any
 
 import jwt
 
-from .repository import OWNER, REPO, REPOSITORY_PATH, STATE_REFERENCE
+from .repository import (
+    AUTOMATION_DISPATCH_PATH,
+    AUTOMATION_REPOSITORY,
+    OWNER,
+    REPO,
+    REPOSITORY,
+    REPOSITORY_PATH,
+    STATE_REFERENCE,
+)
 
 API_ROOT = "https://api.github.com"
 GRAPHQL_PATH = "/graphql"
@@ -38,22 +47,30 @@ class GitHubError(RuntimeError):
 class GitHub:
     """Authenticated, repository-scoped client returned by :func:`create_github`."""
 
-    def __init__(self, token: str, session: Any) -> None:
+    def __init__(self, token: str, session: Any, repository: str = REPOSITORY) -> None:
+        if repository not in (REPOSITORY, AUTOMATION_REPOSITORY):
+            raise ValueError("GitHub repository outside the configured scopes")
         self._token = token
         self._session = session
+        self._repository = repository
 
     def rest(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
-        # API destinations are application-owned, never copied from crash reports.
-        if path not in (GRAPHQL_PATH, REPOSITORY_PATH) and not path.startswith(
-            (f"{REPOSITORY_PATH}/", "/search/issues?")
-        ):
-            raise ValueError("GitHub endpoint outside the configured repository scope")
-        if (
-            method == 'PATCH'
-            and path == f'{REPOSITORY_PATH}/git/refs/{STATE_REFERENCE.removeprefix("refs/")}'
-            and (not isinstance(body, dict) or body.get('force', False) is not False)
-        ):
-            raise ValueError('Investigation state must advance without force')
+
+        if self._repository == AUTOMATION_REPOSITORY:
+            if method != 'POST' or path != AUTOMATION_DISPATCH_PATH or body != {'ref': 'main'}:
+                raise ValueError("Automation scope only permits the trusted workflow dispatch")
+        else:
+            # API destinations are application-owned, never copied from crash reports.
+            if path not in (GRAPHQL_PATH, REPOSITORY_PATH) and not path.startswith(
+                (f"{REPOSITORY_PATH}/", "/search/issues?")
+            ):
+                raise ValueError("GitHub endpoint outside the configured repository scope")
+            if (
+                method == 'PATCH'
+                and path == f'{REPOSITORY_PATH}/git/refs/{STATE_REFERENCE.removeprefix("refs/")}'
+                and (not isinstance(body, dict) or body.get('force', False) is not False)
+            ):
+                raise ValueError('Investigation state must advance without force')
         headers = {
             "Authorization": f"Bearer {self._token}",
             "Accept": "application/vnd.github+json",
@@ -87,6 +104,8 @@ class GitHub:
         import subprocess
         from pathlib import Path
 
+        if self._repository == AUTOMATION_REPOSITORY:
+            raise ValueError("Automation scope cannot check out repositories")
         if not isinstance(ref, str) or re.fullmatch(r'[0-9a-f]{40}', ref) is None:
             raise ValueError('Checkout requires a pinned commit')
         destination = Path(directory)
@@ -127,6 +146,7 @@ def create_github(
     installation_id: str,
     private_key: str,
     *,
+    repository: str = REPOSITORY,
     permissions: dict[str, str] | None = None,
     session: Any = None,
 ) -> GitHub:
@@ -134,7 +154,12 @@ def create_github(
 
     ``session`` must expose ``request(method, url, **kwargs)`` like
     ``requests.Session``; tests inject a deterministic in-memory client.
+    The automation repository accepts only the Actions:write permission.
     """
+    if repository not in (REPOSITORY, AUTOMATION_REPOSITORY):
+        raise ValueError("GitHub repository outside the configured scopes")
+    if repository == AUTOMATION_REPOSITORY and permissions != {'actions': 'write'}:
+        raise ValueError("Automation scope requires exactly Actions:write")
     app_id_text = str(app_id)
     installation_text = str(installation_id)
     if not app_id_text.isdecimal() or not installation_text.isdecimal():
@@ -148,7 +173,7 @@ def create_github(
     now = int(time.time())
     app_token = jwt.encode({"iat": now - 60, "exp": now + 600, "iss": app_id_text},
                            private_key, algorithm="RS256")
-    token_body: dict[str, Any] = {"repositories": [REPO]}
+    token_body: dict[str, Any] = {"repositories": [repository.split('/', 1)[1]]}
     if permissions is not None:
         token_body["permissions"] = permissions
     response = session.request(
@@ -170,7 +195,7 @@ def create_github(
     token = payload.get("token") if isinstance(payload, dict) else None
     if not isinstance(token, str) or not token:
         raise RuntimeError("GitHub installation token unavailable")
-    return GitHub(token, session)
+    return GitHub(token, session, repository=repository)
 
 
 def _issue_number(value: object) -> int:

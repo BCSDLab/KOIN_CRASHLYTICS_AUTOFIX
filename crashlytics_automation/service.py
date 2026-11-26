@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
 
 from .evidence import find_evidence
 from .investigation_jobs import InvestigationQueue, JobConflict, new_job
@@ -26,10 +26,12 @@ from .task_payloads import (
 
 class CrashAutomation:
     def __init__(self, github: Any, config: dict[str, Any], *,
-                 bigquery_client: Any = None) -> None:
+                 bigquery_client: Any = None,
+                 worker_dispatch: Callable[[], None] | None = None) -> None:
         self.github = github
         self.config = config
         self.bigquery_client = bigquery_client
+        self.worker_dispatch = worker_dispatch
 
     def process_fix_task(self, data: dict[str, Any], *, retry_count: int = 0) -> dict[str, Any]:
         context = CrashContext(parse_fix_task(data))
@@ -44,6 +46,10 @@ class CrashAutomation:
             decision = ManualReview('자동 조사 준비 중 오류가 반복되어 사람의 확인이 필요합니다.')
         if isinstance(decision, ManualReview):
             return report_for_human(self.github, context, decision.reason, self.config)
+        if decision.get('outcome') in ('queued', 'delivering'):
+            if self.worker_dispatch is None:
+                raise RuntimeError('Investigation worker dispatch is required for runnable jobs')
+            self.worker_dispatch()
         return decision
 
     def _prepare_fix(self, context: CrashContext, retry_count: int) -> dict[str, Any] | ManualReview:

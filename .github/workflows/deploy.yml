@@ -42,16 +42,17 @@ jobs:
           venv/bin/pip install --disable-pip-version-check --require-hashes -r requirements-test.txt
           venv/bin/python -m pytest -q tests
 
-      - name: Verify existing investigation state access
+      - name: Verify state access and automatic worker dispatch permission
         env:
           CRASHLYTICS_ENV: ${{ secrets.CRASHLYTICS_ENV }}
           CRASHLYTICS_GITHUB_APP_PRIVATE_KEY: ${{ secrets.CRASHLYTICS_GITHUB_APP_PRIVATE_KEY }}
         run: |
           venv/bin/python - <<'PY'
+          import os
           from crashlytics_automation.worker import runtime_config, worker_github
           runtime_config()
-          from crashlytics_automation.github import GitHubError
-          from crashlytics_automation.repository import REPOSITORY_PATH, STATE_REFERENCE
+          from crashlytics_automation.github import GitHubError, create_github
+          from crashlytics_automation.repository import AUTOMATION_REPOSITORY, REPOSITORY_PATH, STATE_REFERENCE
           github = worker_github()
           try:
               github.rest('GET', REPOSITORY_PATH + '/git/ref/' + STATE_REFERENCE.removeprefix('refs/'))
@@ -59,6 +60,14 @@ jobs:
               if error.status != 404:
                   raise
           print('Existing application repository and non-branch state access verified')
+          create_github(
+              os.environ['CRASHLYTICS_GITHUB_APP_ID'],
+              os.environ['CRASHLYTICS_GITHUB_INSTALLATION_ID'],
+              os.environ['CRASHLYTICS_GITHUB_APP_PRIVATE_KEY'],
+              repository=AUTOMATION_REPOSITORY,
+              permissions={'actions': 'write'},
+          )
+          print('Automation-repository Actions-only token permission verified')
           PY
 
       - name: Write runtime configuration

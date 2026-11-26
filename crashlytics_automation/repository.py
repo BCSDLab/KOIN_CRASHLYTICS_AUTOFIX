@@ -12,6 +12,8 @@ OWNER: str
 REPO: str
 OWNER, REPO = REPOSITORY.split('/', 1)
 REPOSITORY_PATH: str = f'/repos/{REPOSITORY}'
+AUTOMATION_REPOSITORY: str = 'BCSDLab/KOIN_CRASHLYTICS_AUTOFIX'
+AUTOMATION_DISPATCH_PATH: str = '/repos/' + AUTOMATION_REPOSITORY + '/actions/workflows/investigate.yml/dispatches'
 TARGET_BRANCHES: tuple[str, str] = ('production', 'develop')
 
 STATE_REFERENCE: str = 'refs/automation/crashlytics-investigations'
