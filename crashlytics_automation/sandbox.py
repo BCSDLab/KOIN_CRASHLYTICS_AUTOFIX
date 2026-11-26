@@ -643,9 +643,9 @@ emulator -avd crashlytics-verification -no-window -no-audio -no-boot-anim -gpu s
 EMULATOR_PID=$!
 trap 'kill "$EMULATOR_PID" 2>/dev/null || true; wait "$EMULATOR_PID" 2>/dev/null || true' EXIT
 READY=0
-BOOT_DEADLINE=$((SECONDS + 180))
+BOOT_DEADLINE=$(($(date +%s) + 180))
 for _ in $(seq 1 90); do
-  [ "$SECONDS" -lt "$BOOT_DEADLINE" ] || break
+  [ "$(date +%s)" -lt "$BOOT_DEADLINE" ] || break
   kill -0 "$EMULATOR_PID" 2>/dev/null || fail_setup "emulator exited before boot"
   if timeout 10s adb get-state 2>/dev/null | grep -qx device &&
      [ "$(timeout 10s adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\\r')" = 1 ]; then READY=1; break; fi

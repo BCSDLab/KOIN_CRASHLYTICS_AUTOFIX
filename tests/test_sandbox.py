@@ -348,7 +348,7 @@ def _run_instrumentation_fixture(tmp_path: Path, monkeypatch, gradle: str, adb: 
     monkeypatch.setenv('HOME', str(home))
     command = _instrumentation_command(':domain:connectedDebugAndroidTest', 'example.GeneratedTest', 'run.logcat')
     command = command.replace('/workspace/scratch', str(scratch))
-    completed = subprocess.run(['bash', '-c', command], cwd=tmp_path, capture_output=True, text=True, timeout=10)
+    completed = subprocess.run(['/bin/sh', '-c', command], cwd=tmp_path, capture_output=True, text=True, timeout=10)
     return completed, scratch
 
 
