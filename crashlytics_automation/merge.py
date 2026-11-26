@@ -139,7 +139,7 @@ def _run_pull_request(run: dict[str, Any], pr_number: int, head_sha: str,
 
 def _verify_checks(github: Any, head_sha: str, head_branch: str, pr_number: int,
                    target: str, base_sha: str) -> dict[str, str] | None:
-    """Verify checks from the latest PR-specific workflow runs."""
+    """Verify every associated run; shared-head PR associations are not event provenance."""
     runs = _pages(
         github, f'{REPOSITORY_PATH}/actions/runs?head_sha={head_sha}', 'workflow_runs',
     )
@@ -166,14 +166,14 @@ def _verify_checks(github: Any, head_sha: str, head_branch: str, pr_number: int,
 
     latest: dict[int, dict[str, Any]] = {}
     for run in matching:
-        workflow_id = run['workflow_id']
-        previous = latest.get(workflow_id)
-        if previous is None or (run['run_number'], run['run_attempt'], run['id']) > (
-            previous['run_number'], previous['run_attempt'], previous['id'],
-        ):
-            latest[workflow_id] = run
+        # GitHub associates both same-head PRs with each run. A newer sibling
+        # run cannot supersede a failed run of the same workflow.
+        run_id = run['id']
+        previous = latest.get(run_id)
+        if previous is None or run['run_attempt'] > previous['run_attempt']:
+            latest[run_id] = run
 
-    observed: dict[str, dict[str, Any]] = {}
+    observed: dict[str, int] = {}
     for run in latest.values():
         jobs = _pages(
             github, f"{REPOSITORY_PATH}/actions/runs/{run['id']}/jobs?filter=latest", 'jobs',
@@ -199,24 +199,23 @@ def _verify_checks(github: Any, head_sha: str, head_branch: str, pr_number: int,
                 return _blocked('check run does not identify the exact workflow run')
             if name in REQUIRED_CHECKS and (check.get('app') or {}).get('slug') != 'github-actions':
                 return _blocked(f'required check has an unexpected publisher: {name}')
-            if name in observed and name in REQUIRED_CHECKS:
+            if name in REQUIRED_CHECKS and name in observed and observed[name] != run['workflow_id']:
                 return _pending(f'required check has ambiguous workflow context: {name}')
-            observed[name] = job
+            observed[name] = run['workflow_id']
             if job.get('status') != 'completed':
                 return _pending(f'check is still running: {name}')
             if job.get('conclusion') in FAILED_CONCLUSIONS:
                 return _pending(f'check failed: {name}')
+            if name in REQUIRED_CHECKS and job.get('conclusion') != 'success':
+                return _pending(f'required check did not succeed: {name}')
     for name in REQUIRED_CHECKS:
-        job = observed.get(name)
-        if job is None:
+        if name not in observed:
             return _pending(f'required check has not reported yet: {name}')
-        if job.get('conclusion') != 'success':
-            return _pending(f'required check did not succeed: {name}')
 
     check_runs = _pages(
         github, f'{REPOSITORY_PATH}/commits/{head_sha}/check-runs?filter=all', 'check_runs',
     )
-    latest_external: dict[tuple[str, str], dict[str, Any]] = {}
+    applicable_external = []
     for check in check_runs:
         if not isinstance(check, dict) or check.get('head_sha') != head_sha:
             return _blocked('check run does not identify the exact pull request head')
@@ -234,11 +233,8 @@ def _verify_checks(github: Any, head_sha: str, head_branch: str, pr_number: int,
         if not isinstance(name, str) or not isinstance(app.get('slug'), str) \
                 or type(check.get('id')) is not int:
             return _pending('external check run is missing immutable context')
-        key = (app['slug'], name)
-        previous = latest_external.get(key)
-        if previous is None or check['id'] > previous['id']:
-            latest_external[key] = check
-    for check in latest_external.values():
+        applicable_external.append(check)
+    for check in applicable_external:
         if not _matching_pull_request_context(
             check, pr_number, head_sha, head_branch, target, base_sha,
         ):

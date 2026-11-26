@@ -88,22 +88,9 @@ class Github:
         ]
 
     def retry_workflow(self, target):
-        run_id = max(self.run_targets) + 1
-        number = 12 if target == 'production' else 13
-        self.run_targets[run_id] = target
-        self.workflow_runs.append({
-            'id': run_id, 'workflow_id': 10, 'run_number': 2,
-            'run_attempt': 1, 'head_sha': HEAD, 'check_suite_id': run_id + 1000,
-            'head_branch': branch_name_for(identity_hash_for(ALERT.issue_id, RELEASE), ISSUE),
-            'repository': {'full_name': f'{OWNER}/{REPO}'},
-            'head_repository': {'full_name': f'{OWNER}/{REPO}'},
-            'pull_requests': [{
-                'number': number,
-                'head': {'ref': branch_name_for(identity_hash_for(ALERT.issue_id, RELEASE), ISSUE),
-                         'sha': HEAD},
-                'base': {'ref': target, 'sha': BASE},
-            }],
-        })
+        for run in self.workflow_runs:
+            if self.run_targets[run['id']] == target:
+                run['run_attempt'] += 1
 
     @staticmethod
     def _pr(number, target, head, state, merged):
@@ -296,6 +283,24 @@ def test_failed_target_ci_cannot_be_hidden_by_sibling_and_same_target_retry_merg
     result = automation.process_merge_task(job, retry_count=1)
     assert result == {'outcome': 'merged', 'complete': False}
     assert github.merged_sha == HEAD
+
+
+@pytest.mark.parametrize('failed_target', [None, 'production', 'develop'])
+def test_shared_head_associations_require_each_workflow_run_to_pass(monkeypatch, failed_target):
+    github, job, _ = setup(monkeypatch)
+    pulls = [run['pull_requests'][0] for run in github.workflow_runs]
+    for run in github.workflow_runs:
+        run['pull_requests'] = pulls
+    if failed_target is not None:
+        github.check_conclusions[failed_target] = 'failure'
+
+    result = attempt_merge(github, job, bot_login='autofix[bot]')
+    if failed_target is None:
+        assert result == {'outcome': 'merged', 'complete': False}
+        assert github.merged_sha == HEAD
+    else:
+        assert result['outcome'] == 'pending'
+        assert github.merged_sha is None
 
 
 @pytest.mark.parametrize('investigation', [None, 'manual', 'wrong-pulls'])
