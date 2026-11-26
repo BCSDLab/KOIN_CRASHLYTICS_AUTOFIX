@@ -41,6 +41,9 @@ class Github:
     def __init__(self, files):
         self.files = files
         self.merged_sha = None
+        self.check_conclusion = 'success'
+        self.check_app = 'github-actions'
+        self.statuses = []
         self.pr = self._pr(12, 'production', HEAD, 'open', False)
         self.peer = self._pr(13, 'develop', 'f' * 40, 'open', False)
 
@@ -77,11 +80,11 @@ class Github:
         if path == f'{REPOSITORY_PATH}/commits/{HEAD}/check-runs?filter=latest&per_page=100&page=1':
             return {'check_runs': [
                 {'id': i, 'name': name, 'head_sha': HEAD, 'status': 'completed',
-                 'conclusion': 'success', 'app': {'slug': 'github-actions'}}
+                 'conclusion': self.check_conclusion, 'app': {'slug': self.check_app}}
                 for i, name in enumerate(('Lint & Format Check', 'Code Coverage'), 1)
             ]}
         if path == f'{REPOSITORY_PATH}/commits/{HEAD}/status?per_page=100&page=1':
-            return {'statuses': []}
+            return {'statuses': self.statuses}
         if method == 'PUT' and path == f'{REPOSITORY_PATH}/pulls/12/merge':
             self.merged_sha = data['sha']
             return {'merged': True}
@@ -155,4 +158,160 @@ def test_moved_head_blocks_before_publication_lookup(monkeypatch):
     github.pr['head']['sha'] = '9' * 40
     result = attempt_merge(github, job, bot_login='autofix[bot]')
     assert result['outcome'] == 'blocked'
+    assert github.merged_sha is None
+
+
+def _registered_investigation(job, status='merging'):
+    return {
+        'status': status,
+        'branches': {
+            branch: {
+                'pullNumber': pull['number'],
+                'headSha': pull['headSha'],
+            }
+            for branch, pull in job['pullRequests'].items()
+        },
+    }
+
+
+def test_failed_ci_retries_then_same_head_verified_success_merges(monkeypatch):
+    from crashlytics_automation import service
+
+    github, job, _ = setup(monkeypatch)
+    github.check_conclusion = 'failure'
+    investigation = _registered_investigation(job)
+
+    class Queue:
+        def __init__(self, _github):
+            pass
+
+        def get(self, _alert):
+            return investigation
+
+    monkeypatch.setattr(service, 'InvestigationQueue', Queue)
+    monkeypatch.setattr(service, 'verify_crash_issue', lambda *_args: None)
+    automation = service.CrashAutomation(github, {'botLogin': 'autofix[bot]'})
+
+    with pytest.raises(RuntimeError, match='retry merge later'):
+        automation.process_merge_task(job)
+    assert github.merged_sha is None
+    assert investigation['status'] == 'merging'
+
+    github.check_conclusion = 'success'
+    result = automation.process_merge_task(job, retry_count=1)
+    assert result == {'outcome': 'merged', 'complete': False}
+    assert github.merged_sha == HEAD
+
+
+@pytest.mark.parametrize('investigation', [None, 'manual', 'wrong-pulls'])
+def test_merge_requires_registered_active_matching_investigation(monkeypatch, investigation):
+    from crashlytics_automation import service
+
+    github, job, _ = setup(monkeypatch)
+    if investigation is None:
+        stored = None
+    elif investigation == 'manual':
+        stored = _registered_investigation(job, 'manual')
+    else:
+        stored = _registered_investigation(job)
+        stored['branches']['production']['headSha'] = '9' * 40
+
+    class Queue:
+        def __init__(self, _github):
+            pass
+
+        def get(self, _alert):
+            return stored
+
+    attempts = []
+    monkeypatch.setattr(service, 'InvestigationQueue', Queue)
+    monkeypatch.setattr(service, 'verify_crash_issue', lambda *_args: None)
+    monkeypatch.setattr(service, 'attempt_merge', lambda *_args, **_kwargs: attempts.append(True))
+    result = service.CrashAutomation(github, {'botLogin': 'autofix[bot]'}).process_merge_task(job)
+    assert result == {'outcome': 'superseded', 'issueNumber': ISSUE}
+    assert attempts == []
+    assert github.merged_sha is None
+
+
+@pytest.mark.parametrize('problem', ['publisher', 'head'])
+def test_ci_publisher_or_changed_head_remains_blocked(monkeypatch, problem):
+    github, job, _ = setup(monkeypatch)
+    if problem == 'publisher':
+        github.check_app = 'untrusted-app'
+    else:
+        github.pr['head']['sha'] = '9' * 40
+    result = attempt_merge(github, job, bot_login='autofix[bot]')
+    assert result['outcome'] == 'blocked'
+    assert github.merged_sha is None
+
+
+@pytest.mark.parametrize('failure', ['failure', 'cancelled', 'startup_failure', 'commit-status'])
+def test_known_ci_failures_are_retryable_and_never_merge(monkeypatch, failure):
+    github, job, _ = setup(monkeypatch)
+    if failure == 'commit-status':
+        github.statuses = [{'state': 'failure'}]
+    else:
+        github.check_conclusion = failure
+    result = attempt_merge(github, job, bot_login='autofix[bot]')
+    assert result['outcome'] == 'pending'
+    assert github.merged_sha is None
+
+
+def test_retry_does_not_authorize_a_changed_head(monkeypatch):
+    from crashlytics_automation import service
+
+    github, job, _ = setup(monkeypatch)
+    github.check_conclusion = 'failure'
+    investigation = _registered_investigation(job)
+
+    class Queue:
+        def __init__(self, _github):
+            pass
+
+        def get(self, _alert):
+            return investigation
+
+        def put(self, updated):
+            investigation.update(updated)
+
+    monkeypatch.setattr(service, 'InvestigationQueue', Queue)
+    monkeypatch.setattr(service, 'verify_crash_issue', lambda *_args: None)
+    monkeypatch.setattr(service, 'report_for_human', lambda *_args, **_kwargs: {'outcome': 'manual'})
+    automation = service.CrashAutomation(github, {'botLogin': 'autofix[bot]'})
+
+    with pytest.raises(RuntimeError, match='retry merge later'):
+        automation.process_merge_task(job)
+    github.pr['head']['sha'] = '9' * 40
+    result = automation.process_merge_task(job, retry_count=1)
+    assert result == {'outcome': 'manual'}
+    assert github.merged_sha is None
+    assert investigation['status'] == 'manual'
+
+
+def test_failed_ci_stops_at_existing_retry_deadline_without_merging(monkeypatch):
+    from crashlytics_automation import service
+
+    github, job, _ = setup(monkeypatch)
+    github.check_conclusion = 'failure'
+    investigation = _registered_investigation(job)
+
+    class Queue:
+        def __init__(self, _github):
+            pass
+
+        def get(self, _alert):
+            return investigation
+
+        def put(self, updated):
+            investigation.update(updated)
+
+    monkeypatch.setattr(service, 'InvestigationQueue', Queue)
+    monkeypatch.setattr(service, 'verify_crash_issue', lambda *_args: None)
+    monkeypatch.setattr(service, 'report_for_human', lambda *_args, **_kwargs: {'outcome': 'manual'})
+    automation = service.CrashAutomation(github, {'botLogin': 'autofix[bot]'})
+
+    result = automation.process_merge_task(job, retry_count=service.MAX_MERGE_RETRIES)
+
+    assert result == {'outcome': 'manual'}
+    assert investigation['status'] == 'manual'
     assert github.merged_sha is None

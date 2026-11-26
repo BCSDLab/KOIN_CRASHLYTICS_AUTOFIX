@@ -139,15 +139,15 @@ def _verify_checks(github: Any, head_sha: str) -> dict[str, str] | None:
         if run.get('status') != 'completed':
             return _pending(f'required check is still running: {name}')
         if run.get('conclusion') != 'success':
-            return _blocked(f'required check did not succeed: {name}')
+            return _pending(f'required check did not succeed: {name}')
     for name, run in latest.items():
         if run.get('conclusion') in FAILED_CONCLUSIONS:
-            return _blocked(f'check failed: {name}')
+            return _pending(f'check failed: {name}')
         if run.get('status') != 'completed':
             return _pending(f'check is still running: {name}')
     statuses = _pages(github, f'{REPOSITORY_PATH}/commits/{head_sha}/status', 'statuses')
     if any(status.get('state') in ('failure', 'error') for status in statuses):
-        return _blocked('a commit status failed')
+        return _pending('a commit status failed')
     if any(status.get('state') != 'success' for status in statuses):
         return _pending('a commit status is pending or unknown')
     return None

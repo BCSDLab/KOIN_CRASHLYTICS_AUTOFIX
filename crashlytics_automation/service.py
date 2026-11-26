@@ -87,33 +87,32 @@ class CrashAutomation:
         verify_crash_issue(self.github, context)
         queue = InvestigationQueue(self.github)
         investigation = queue.get(context.alert)
-        if investigation is not None:
-            expected = {branch: {'number': fix['pullNumber'], 'headSha': fix['headSha']}
-                        for branch, fix in investigation['branches'].items()}
-            if investigation['status'] not in ('delivering', 'merging', 'complete') or expected != job['pullRequests']:
-                return {'outcome': 'superseded', 'issueNumber': context.issue_number}
+        if investigation is None:
+            return {'outcome': 'superseded', 'issueNumber': context.issue_number}
+        expected = {branch: {'number': fix['pullNumber'], 'headSha': fix['headSha']}
+                    for branch, fix in investigation['branches'].items()}
+        if investigation['status'] not in ('delivering', 'merging', 'complete') or expected != job['pullRequests']:
+            return {'outcome': 'superseded', 'issueNumber': context.issue_number}
         result = attempt_merge(self.github, job, bot_login=self.config['botLogin'])
         if result['outcome'] == 'pending' and retry_count < MAX_MERGE_RETRIES:
             raise RuntimeError('Required checks pending; retry merge later')
         if result['outcome'] == 'merged':
             if result['complete']:
-                if investigation is not None:
-                    investigation['status'] = 'complete'
-                    queue.put(investigation)
-                    if any(active['alert']['issueId'] == context.alert.issue_id
-                           for active in queue.active()):
-                        return {**result, 'complete': False}
-                    context.evidence = dict(context.evidence or {})
-                    context.evidence['investigation'] = {
-                        'status': 'complete', 'analyses': investigation['analyses'],
-                        'runUrl': investigation.get('runUrl'),
-                    }
-                    record_fix_progress(self.github, context, self.config)
+                investigation['status'] = 'complete'
+                queue.put(investigation)
+                if any(active['alert']['issueId'] == context.alert.issue_id
+                       for active in queue.active()):
+                    return {**result, 'complete': False}
+                context.evidence = dict(context.evidence or {})
+                context.evidence['investigation'] = {
+                    'status': 'complete', 'analyses': investigation['analyses'],
+                    'runUrl': investigation.get('runUrl'),
+                }
+                record_fix_progress(self.github, context, self.config)
                 close_fixed_issue(self.github, context)
             return result
         reason = (f"자동 수정 PR #{job['pullNumber']}을 머지할 수 없습니다: "
                   + result.get('reason', '필수 CI 대기 기한이 지났습니다.'))
-        if investigation is not None:
-            investigation['status'], investigation['reason'] = 'manual', reason
-            queue.put(investigation)
+        investigation['status'], investigation['reason'] = 'manual', reason
+        queue.put(investigation)
         return report_for_human(self.github, context, reason, self.config, failed_pr=job['pullNumber'])

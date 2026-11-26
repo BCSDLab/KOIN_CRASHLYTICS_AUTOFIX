@@ -75,7 +75,8 @@ def test_compile_error_does_not_count_as_baseline_reproduction(tmp_path: Path) -
 
 
 
-def test_android_setup_marker_is_retryable_in_structured_verification(tmp_path: Path) -> None:
+@pytest.mark.parametrize('exit_code', [70, 1])
+def test_android_setup_marker_requires_setup_exit_status(tmp_path: Path, exit_code: int) -> None:
     sandbox = _sandbox(tmp_path)
     sandbox._new_container = lambda *_args: 'fake-container'  # type: ignore[method-assign]
     sandbox._stop_container = lambda *_args: None  # type: ignore[method-assign]
@@ -84,7 +85,7 @@ def test_android_setup_marker_is_retryable_in_structured_verification(tmp_path: 
     def setup_failure(_container: str, command: str, _timeout: int) -> dict[str, object]:
         calls.append(command)
         return {
-            'exit_code': 70,
+            'exit_code': exit_code,
             'stdout': '',
             'stderr': 'VERIFICATION_SETUP_FAILURE: emulator readiness timed out',
             'timed_out': False,
@@ -104,20 +105,16 @@ def test_android_setup_marker_is_retryable_in_structured_verification(tmp_path: 
         sandbox.close()
 
     assert result['passed'] is False
-    assert result['retryable'] is True
-    assert result['checks'][0]['test_result'] == 'setup-failure'
-    assert 'assembleDebug' in calls[0]
-    assert 'VERIFICATION_SETUP_FAILURE:' not in calls[0]
+    assert result['retryable'] is (exit_code == 70)
+    assert result['checks'][0]['test_result'] == ('setup-failure' if exit_code == 70 else 'missing-or-not-failing')
 
 
 def test_host_command_timeout_is_retryable(tmp_path: Path) -> None:
     sandbox = _sandbox(tmp_path)
     sandbox._new_container = lambda *_args: 'fake-container'  # type: ignore[method-assign]
     sandbox._stop_container = lambda *_args: None  # type: ignore[method-assign]
-    calls = []
 
     def timed_out(_container: str, command: str, _timeout: int) -> dict[str, object]:
-        calls.append(command)
         if command.endswith(':tasks --all'):
             return {'exit_code': 0, 'stdout': 'testDebugUnitTest - Runs unit tests\n',
                     'stderr': '', 'timed_out': False}
@@ -135,6 +132,8 @@ def test_host_command_timeout_is_retryable(tmp_path: Path) -> None:
     assert result['passed'] is False
     assert result['retryable'] is True
     assert result['checks'][-1]['test_result'] == 'timeout'
+
+
 def test_sandbox_keeps_host_checkout_untouched_and_sanitizes_secrets(tmp_path: Path) -> None:
     target = tmp_path / 'target'
     release = tmp_path / 'release'
@@ -419,8 +418,7 @@ def test_instrumentation_build_failure_precedes_emulator_start(tmp_path: Path, m
         'echo "$*" >> "$HOME/gradle.log"; exit 1',
         'exit 1',
     )
-    assert completed.returncode == 70
-    assert 'VERIFICATION_SETUP_FAILURE: pristine instrumentation APK build failed' in completed.stderr
+    assert completed.returncode == 1
     assert 'assembleDebug' in (tmp_path / 'home/gradle.log').read_text()
     assert not (scratch / 'emulator.log').exists()
 

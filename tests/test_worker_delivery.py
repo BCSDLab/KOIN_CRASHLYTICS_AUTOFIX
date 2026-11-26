@@ -401,12 +401,12 @@ def test_retryable_verification_uses_checkpoint_without_model_recall(monkeypatch
     monkeypatch.setattr('crashlytics_automation.fix_generation.existing_fix', lambda *_a, **_k: None)
     monkeypatch.setattr(
         'crashlytics_automation.fix_generation.publish_investigated_fix',
-        lambda **_kwargs: publications.append(True) or _fix('production', 24),
+        lambda *_args, **_kwargs: publications.append(True) or _fix('production', 24),
     )
     monkeypatch.setattr('crashlytics_automation.release_source.resolve_release_commit',
                         lambda *_a, **_k: RELEASE_SHA)
     monkeypatch.setattr('crashlytics_automation.release_source.resolve_investigated_source',
-                        lambda **_kwargs: _source())
+                        lambda *_args, **_kwargs: SourceLocation.from_payload(_source()))
     monkeypatch.setattr('crashlytics_automation.pull_requests.branch_head_sha',
                         lambda _g, branch: BASE_SHA if branch == 'production' else '9' * 40)
     monkeypatch.setattr('crashlytics_automation.openai_client.request_fix_proposal',
@@ -429,6 +429,8 @@ def test_retryable_verification_uses_checkpoint_without_model_recall(monkeypatch
     assert second == {'outcome': 'queued', 'issueNumber': 17, 'baseBranch': 'production', 'pullNumber': 24}
     assert queue.latest['branches']['production']['pullNumber'] == 24
     assert len(publications) == 1
+
+
 @pytest.mark.parametrize('prior_attempts', [0, 3])
 def test_interrupted_provider_failure_keeps_incremental_trace_and_retries_only_pending_report(monkeypatch, tmp_path, prior_attempts):
     from crashlytics_automation import issues

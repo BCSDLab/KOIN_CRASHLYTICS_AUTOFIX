@@ -471,6 +471,7 @@ class InvestigationSandbox:
                     workspace, module, test['class'], scratch / f'baseline-{index}.logcat.txt',
                     baseline['stdout'] + '\n' + baseline['stderr'],
                 ) if instrumented and not baseline['timed_out'] else None
+                reproduced = baseline['exit_code'] != 0 and not baseline['timed_out'] and (xml_failure or oom is not None)
                 checks.append({
                     'phase': 'baseline', 'path': test['path'].as_posix(),
                     'exit_code': baseline['exit_code'], 'timed_out': baseline['timed_out'],
@@ -656,7 +657,8 @@ _INSTRUMENTATION_GRADLE_ARGS = (
 
 
 def _instrumentation_setup_failure(result: dict[str, Any]) -> bool:
-    return 'VERIFICATION_SETUP_FAILURE:' in (result.get('stdout', '') + result.get('stderr', ''))
+    return (result.get('exit_code') == 70
+            and 'VERIFICATION_SETUP_FAILURE:' in (result.get('stdout', '') + result.get('stderr', '')))
 
 
 
@@ -682,7 +684,7 @@ mkdir -p "$HOME/.android/avd" "$SCRATCH"
 fail_setup() {{ echo "VERIFICATION_SETUP_FAILURE: $*" >&2; exit 70; }}
 echo no | avdmanager create avd --force --name crashlytics-verification --package "system-images;android-34;google_apis;x86_64" --device pixel_2 >"$SCRATCH/avdmanager.log" 2>&1 || fail_setup "AVD creation failed"
 test -s "$HOME/.android/avd/crashlytics-verification.avd/config.ini" || fail_setup "AVD configuration missing"
-./gradlew {_INSTRUMENTATION_GRADLE_ARGS} :{module_task}:assembleDebug :{module_task}:assembleDebugAndroidTest
+./gradlew {_INSTRUMENTATION_GRADLE_ARGS} :{module_task}:assembleDebug :{module_task}:assembleDebugAndroidTest || exit "$?"
 emulator -avd crashlytics-verification -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect -no-snapshot -wipe-data -memory 1536 -cores 2 >"$SCRATCH/emulator.log" 2>&1 &
 EMULATOR_PID=$!
 trap 'kill "$EMULATOR_PID" 2>/dev/null || true; wait "$EMULATOR_PID" 2>/dev/null || true' EXIT

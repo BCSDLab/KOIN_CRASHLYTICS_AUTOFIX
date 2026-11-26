@@ -141,7 +141,9 @@ def prepare_existing_issue(
             if job['attempts'].get(target, 0) != DEFAULT_ATTEMPT_LIMIT:
                 raise ValueError('Only one additional attempt after the default limit may be approved')
             job.setdefault('attemptLimits', {})[target] = APPROVED_ATTEMPT_LIMIT
-        job.pop('verificationResumeRequired', None)
+        job['status'] = 'queued'
+        job.pop('reason', None)
+        job.pop('reportPending', None)
         if verification_only:
             job['verificationOnly'] = True
         changed = True
@@ -282,7 +284,6 @@ def run_job(github: Any, config: dict[str, Any], job: dict[str, Any]) -> dict[st
     context = _context(job)
     if job.get('status') == 'manual':
         if job.get('reportPending') is True:
-            job.pop('verificationResumeRequired', None)
             return _report(github, queue, job, config) or {
                 'outcome': 'manual', 'issueNumber': context.issue_number,
             }
@@ -299,12 +300,11 @@ def run_job(github: Any, config: dict[str, Any], job: dict[str, Any]) -> dict[st
     tool_trace: list[dict[str, Any]] = []
     partial_analysis = True
     try:
-        if job['status'] in ('manual', 'merging', 'complete') and job.get('reportPending') is True:
+        if job['status'] in ('merging', 'complete') and job.get('reportPending') is True:
             result = _report(github, queue, job, config)
             return result or {'outcome': job['status'], 'issueNumber': context.issue_number}
         if target is None:
             return _deliver(github, queue, job, config)
-        job.pop('verificationResumeRequired', None)
         attempts = job['attempts'].get(target, 0)
         job['status'] = 'running'
         job['startedAt'] = datetime.now(timezone.utc).isoformat()
@@ -514,7 +514,6 @@ def run_job(github: Any, config: dict[str, Any], job: dict[str, Any]) -> dict[st
                             return {'outcome': 'queued', 'issueNumber': context.issue_number,
                                     'baseBranch': target, 'verificationRetry': retries + 1}
                         raise ValueError(reason)
-                    job.pop('verificationResumeRequired', None)
                     source = resolve_investigated_source(github, release_sha=release,
                                                         path=decision['sourcePath'], line=decision['sourceLine'])
                     if isinstance(source, ManualReview):
@@ -532,7 +531,6 @@ def run_job(github: Any, config: dict[str, Any], job: dict[str, Any]) -> dict[st
                     )
                     if isinstance(published, ManualReview):
                         raise ValueError(published.reason)
-                    job.pop('verificationResumeRequired', None)
                     job['branches'][target] = published.to_payload()
                     job['status'] = 'queued' if len(job['branches']) < len(TARGET_BRANCHES) else 'delivering'
                     queue.put(job)
@@ -582,7 +580,7 @@ def run_job(github: Any, config: dict[str, Any], job: dict[str, Any]) -> dict[st
                 return {'outcome': 'superseded', 'issueNumber': context.issue_number}
             _report(github, queue, job, config)
             return {'outcome': 'delivering', 'issueNumber': context.issue_number}
-        job.pop('verificationResumeRequired', None)
+        job['status'], job['reason'], job['reportPending'] = 'manual', reason, True
         try:
             queue.put(job)
         except JobConflict:
@@ -637,7 +635,6 @@ def main() -> int:
         if arguments.verification_only and jobs:
             if jobs[0].get('verificationOnly') is not True:
                 jobs[0]['verificationOnly'] = True
-                jobs[0].pop('verificationResumeRequired', None)
                 queue.put(jobs[0])
     if arguments.verification_only and jobs:
         target = next((branch for branch in TARGET_BRANCHES if branch not in jobs[0]['branches']), None)
