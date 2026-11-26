@@ -33,6 +33,20 @@ def read_json_blob(github, blob_sha, maximum):
     return json.loads(raw.decode('utf-8'))
 
 
+def raw_entries(github, revision):
+    commit = github.rest('GET', f'{REPOSITORY_PATH}/git/commits/{revision}')
+    tree_sha = commit.get('tree', {}).get('sha')
+    if not isinstance(tree_sha, str) or re.fullmatch(r'[0-9a-f]{40}', tree_sha) is None:
+        raise ValueError('Migration source has no valid Git tree')
+    tree = github.rest('GET', f'{REPOSITORY_PATH}/git/trees/{tree_sha}?recursive=1')
+    if tree.get('truncated') or not isinstance(tree.get('tree'), list):
+        raise ValueError('Migration requires the complete metadata tree')
+    return {
+        entry['path']: entry['sha'] for entry in tree['tree']
+        if entry.get('type') == 'blob' and entry.get('mode') == '100644'
+    }
+
+
 def main():
     config = runtime_config()
     github = worker_github()
@@ -40,7 +54,7 @@ def main():
     snapshot = os.environ['SOURCE_METADATA_SHA']
     if re.fullmatch(r'[0-9a-f]{40}', snapshot) is None:
         raise ValueError('Migration requires the immutable pre-cutover metadata commit')
-    entries = queue._entries(snapshot)
+    entries = raw_entries(github, snapshot)
     source_job = read_json_blob(github, entries[f'jobs/{JOB_ID}.json'], 512 * 1024)
     job = queue.get(parse_alert_payload(source_job['alert']))
     if job is None or job['id'] != JOB_ID or job['issueNumber'] != 1789 or job['status'] != 'manual':
@@ -161,7 +175,7 @@ def main():
             github.rest('PATCH', f'{REPOSITORY_PATH}/pulls/{number}', {'state': 'closed'})
 
     head = queue._written_head or queue._head()
-    current_entries = queue._entries(head)
+    current_entries = raw_entries(github, head)
     deletions = []
     for path, blob_sha, _manifest in legacy.values():
         current = current_entries.get(path)
