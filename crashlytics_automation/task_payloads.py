@@ -93,9 +93,9 @@ def validate_merge_task(job: Any) -> None:
                 or not isinstance(head, str) or re.fullmatch(r'[0-9a-f]{40}', head) is None:
             raise ValueError('Invalid hotfix pull request')
         numbers.append(number)
-    if len(set(numbers)) != len(TARGET_BRANCHES) or pulls[branch] != {
-        'number': job['pullNumber'], 'headSha': job['headSha'],
-    }:
+    if (len(set(numbers)) != len(TARGET_BRANCHES)
+            or len({pulls[target]['headSha'] for target in TARGET_BRANCHES}) != 1
+            or pulls[branch] != {'number': job['pullNumber'], 'headSha': job['headSha']}):
         raise ValueError('Inconsistent hotfix pull requests')
 
 

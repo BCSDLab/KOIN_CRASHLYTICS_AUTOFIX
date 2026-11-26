@@ -5,6 +5,7 @@ import pytest
 from crashlytics_automation.candidate import (
     branch_name_for, candidate_manifest, identity_hash_for, manifest_digest, sha256,
 )
+from crashlytics_automation.task_payloads import validate_merge_task
 from crashlytics_automation.merge import attempt_merge
 from crashlytics_automation.models import CrashAlert
 from crashlytics_automation.repository import OWNER, REPO, REPOSITORY_PATH
@@ -28,12 +29,13 @@ class Store:
     def __init__(self, _github):
         pass
 
-    def get_publication(self, head):
+    def get_publication(self, head, target):
         if self.record == 'missing':
             return None
         if self.record == 'tampered':
             raise ValueError('record digest mismatch')
         assert head == HEAD
+        assert target in ('production', 'develop')
         return self.record
 
 
@@ -41,11 +43,67 @@ class Github:
     def __init__(self, files):
         self.files = files
         self.merged_sha = None
-        self.check_conclusion = 'success'
+        self.workflow_runs = []
+        self.run_targets = {}
+        self.check_conclusions = {'production': 'success', 'develop': 'success'}
         self.check_app = 'github-actions'
+        self.external_check_runs = []
         self.statuses = []
         self.pr = self._pr(12, 'production', HEAD, 'open', False)
-        self.peer = self._pr(13, 'develop', 'f' * 40, 'open', False)
+        self.peer = self._pr(13, 'develop', HEAD, 'open', False)
+        for workflow_run_id, (number, target) in enumerate(
+            ((12, 'production'), (13, 'develop')), start=100,
+        ):
+            self.run_targets[workflow_run_id] = target
+            self.workflow_runs.append({
+                'id': workflow_run_id, 'workflow_id': 10, 'run_number': 1,
+                'run_attempt': 1, 'head_sha': HEAD,
+                'check_suite_id': workflow_run_id + 1000,
+                'head_branch': branch_name_for(identity_hash_for(ALERT.issue_id, RELEASE), ISSUE),
+                'repository': {'full_name': f'{OWNER}/{REPO}'},
+                'head_repository': {'full_name': f'{OWNER}/{REPO}'},
+                'pull_requests': [{
+                    'number': number,
+                    'head': {'ref': branch_name_for(identity_hash_for(ALERT.issue_id, RELEASE), ISSUE),
+                             'sha': HEAD, 'repo': {'full_name': f'{OWNER}/{REPO}'}},
+                    'base': {'ref': target, 'sha': BASE, 'repo': {'full_name': f'{OWNER}/{REPO}'}},
+                }],
+            })
+
+    @property
+    def check_conclusion(self):
+        return self.check_conclusions['production']
+
+    @check_conclusion.setter
+    def check_conclusion(self, conclusion):
+        self.check_conclusions = {'production': conclusion, 'develop': conclusion}
+
+
+    def _jobs(self, run_id):
+        conclusion = self.check_conclusions[self.run_targets[run_id]]
+        return [
+            {'name': name, 'run_id': run_id, 'status': 'completed',
+             'conclusion': conclusion, 'check_run_url': f'https://api.github.com{REPOSITORY_PATH}/check-runs/{run_id * 10 + index}'}
+            for index, name in enumerate(('Lint & Format Check', 'Code Coverage'), 1)
+        ]
+
+    def retry_workflow(self, target):
+        run_id = max(self.run_targets) + 1
+        number = 12 if target == 'production' else 13
+        self.run_targets[run_id] = target
+        self.workflow_runs.append({
+            'id': run_id, 'workflow_id': 10, 'run_number': 2,
+            'run_attempt': 1, 'head_sha': HEAD, 'check_suite_id': run_id + 1000,
+            'head_branch': branch_name_for(identity_hash_for(ALERT.issue_id, RELEASE), ISSUE),
+            'repository': {'full_name': f'{OWNER}/{REPO}'},
+            'head_repository': {'full_name': f'{OWNER}/{REPO}'},
+            'pull_requests': [{
+                'number': number,
+                'head': {'ref': branch_name_for(identity_hash_for(ALERT.issue_id, RELEASE), ISSUE),
+                         'sha': HEAD},
+                'base': {'ref': target, 'sha': BASE},
+            }],
+        })
 
     @staticmethod
     def _pr(number, target, head, state, merged):
@@ -53,21 +111,24 @@ class Github:
         return {
             'number': number, 'state': state, 'merged': merged, 'draft': False,
             'mergeable': True, 'body': 'Closes #17', 'user': {'login': 'autofix[bot]'},
-            'head': {'sha': head, 'ref': branch_name_for(identity, target, ISSUE),
+            'head': {'sha': head, 'ref': branch_name_for(identity, ISSUE),
                      'repo': {'full_name': f'{OWNER}/{REPO}'}},
             'base': {'sha': BASE, 'ref': target, 'repo': {'full_name': f'{OWNER}/{REPO}'}},
         }
 
     def rest(self, method, path, data=None):
-        if path == f'{REPOSITORY_PATH}/pulls/12':
-            return self.pr
-        if path == f'{REPOSITORY_PATH}/pulls/13':
-            return self.peer
-        if path == f'{REPOSITORY_PATH}/git/ref/heads/production':
+        if path.startswith(f'{REPOSITORY_PATH}/pulls/') and path.count('/') == len(REPOSITORY_PATH.split('/')) + 1:
+            number = int(path.rsplit('/', 1)[1])
+            if number == self.pr['number']:
+                return self.pr
+            if number == self.peer['number']:
+                return self.peer
+        if path in (f'{REPOSITORY_PATH}/git/ref/heads/production',
+                    f'{REPOSITORY_PATH}/git/ref/heads/develop'):
             return {'object': {'sha': BASE}}
         if path == f'{REPOSITORY_PATH}/commits/{HEAD}':
             return {'parents': [{'sha': BRANCH_BASE}]}
-        if path == f'{REPOSITORY_PATH}/pulls/12/files?per_page=100&page=1':
+        if path.startswith(f'{REPOSITORY_PATH}/pulls/') and path.endswith('/files?per_page=100&page=1'):
             return [{'filename': name, 'status': 'modified' if name == SOURCE else 'added'}
                     for name in self.files]
         if path.startswith(f'{REPOSITORY_PATH}/contents/'):
@@ -77,15 +138,24 @@ class Github:
                 raise NotFound()
             return {'type': 'file', 'encoding': 'base64',
                     'content': base64.b64encode(content).decode(), 'size': len(content)}
-        if path == f'{REPOSITORY_PATH}/commits/{HEAD}/check-runs?filter=latest&per_page=100&page=1':
-            return {'check_runs': [
-                {'id': i, 'name': name, 'head_sha': HEAD, 'status': 'completed',
-                 'conclusion': self.check_conclusion, 'app': {'slug': self.check_app}}
-                for i, name in enumerate(('Lint & Format Check', 'Code Coverage'), 1)
-            ]}
+        if path == f'{REPOSITORY_PATH}/actions/runs?head_sha={HEAD}&per_page=100&page=1':
+            return {'workflow_runs': self.workflow_runs}
+        if path.startswith(f'{REPOSITORY_PATH}/actions/runs/') and path.endswith('/jobs?filter=latest&per_page=100&page=1'):
+            run_id = int(path.split('/actions/runs/', 1)[1].split('/', 1)[0])
+            return {'jobs': self._jobs(run_id)}
+        if path.startswith(f'{REPOSITORY_PATH}/check-runs/'):
+            check_id = int(path.rsplit('/', 1)[1])
+            run_id, index = divmod(check_id, 10)
+            name = ('Lint & Format Check', 'Code Coverage')[index - 1]
+            return {
+                'name': name, 'head_sha': HEAD, 'app': {'slug': self.check_app},
+                'check_suite': {'id': run_id + 1000},
+            }
+        if path == f'{REPOSITORY_PATH}/commits/{HEAD}/check-runs?filter=all&per_page=100&page=1':
+            return {'check_runs': self.external_check_runs}
         if path == f'{REPOSITORY_PATH}/commits/{HEAD}/status?per_page=100&page=1':
             return {'statuses': self.statuses}
-        if method == 'PUT' and path == f'{REPOSITORY_PATH}/pulls/12/merge':
+        if method == 'PUT' and path == f"{REPOSITORY_PATH}/pulls/{self.pr['number']}/merge":
             self.merged_sha = data['sha']
             return {'merged': True}
         raise AssertionError((method, path))
@@ -116,7 +186,7 @@ def setup(monkeypatch, *, extra=False):
         'headSha': HEAD, 'baseSha': BASE, 'manifestDigest': manifest_digest(manifest),
         'baseBranch': 'production',
         'pullRequests': {'production': {'number': 12, 'headSha': HEAD},
-                         'develop': {'number': 13, 'headSha': 'f' * 40}},
+                         'develop': {'number': 13, 'headSha': HEAD}},
     }
     monkeypatch.setattr('crashlytics_automation.merge.InvestigationQueue', Store)
     return github, job, manifest
@@ -127,6 +197,30 @@ def test_source_and_test_only_pr_merges_exact_published_head(monkeypatch):
     result = attempt_merge(github, job, bot_login='autofix[bot]')
     assert result == {'outcome': 'merged', 'complete': False}
     assert github.merged_sha == HEAD
+
+
+def test_same_head_peer_waits_for_production_then_develop_merges(monkeypatch):
+    github, job, _ = setup(monkeypatch)
+    job['baseBranch'] = 'develop'
+    job['pullNumber'] = 13
+    github.pr, github.peer = github.peer, github.pr
+
+    result = attempt_merge(github, job, bot_login='autofix[bot]')
+    assert result['outcome'] == 'pending'
+    assert github.merged_sha is None
+
+    github.peer['state'] = 'closed'
+    github.peer['merged'] = True
+    result = attempt_merge(github, job, bot_login='autofix[bot]')
+    assert result == {'outcome': 'merged', 'complete': True}
+    assert github.merged_sha == HEAD
+
+
+def test_merge_task_requires_both_targets_to_pin_the_same_head(monkeypatch):
+    _, job, _ = setup(monkeypatch)
+    job['pullRequests']['develop']['headSha'] = 'f' * 40
+    with pytest.raises(ValueError, match='Inconsistent hotfix pull requests'):
+        validate_merge_task(job)
 
 
 def test_extra_automation_file_is_rejected(monkeypatch):
@@ -174,11 +268,11 @@ def _registered_investigation(job, status='merging'):
     }
 
 
-def test_failed_ci_retries_then_same_head_verified_success_merges(monkeypatch):
+def test_failed_target_ci_cannot_be_hidden_by_sibling_and_same_target_retry_merges(monkeypatch):
     from crashlytics_automation import service
 
     github, job, _ = setup(monkeypatch)
-    github.check_conclusion = 'failure'
+    github.check_conclusions['production'] = 'failure'
     investigation = _registered_investigation(job)
 
     class Queue:
@@ -197,7 +291,8 @@ def test_failed_ci_retries_then_same_head_verified_success_merges(monkeypatch):
     assert github.merged_sha is None
     assert investigation['status'] == 'merging'
 
-    github.check_conclusion = 'success'
+    github.check_conclusions['production'] = 'success'
+    github.retry_workflow('production')
     result = automation.process_merge_task(job, retry_count=1)
     assert result == {'outcome': 'merged', 'complete': False}
     assert github.merged_sha == HEAD
@@ -233,15 +328,71 @@ def test_merge_requires_registered_active_matching_investigation(monkeypatch, in
     assert github.merged_sha is None
 
 
-@pytest.mark.parametrize('problem', ['publisher', 'head'])
-def test_ci_publisher_or_changed_head_remains_blocked(monkeypatch, problem):
+@pytest.mark.parametrize('problem', ['publisher', 'head', 'target', 'old-branch'])
+def test_ci_publisher_or_changed_head_or_target_or_branch_remains_blocked(monkeypatch, problem):
     github, job, _ = setup(monkeypatch)
     if problem == 'publisher':
         github.check_app = 'untrusted-app'
-    else:
+    elif problem == 'head':
         github.pr['head']['sha'] = '9' * 40
+    elif problem == 'target':
+        github.pr['base']['ref'] = 'develop'
+    else:
+        identity = identity_hash_for(ALERT.issue_id, RELEASE)
+        github.pr['head']['ref'] = f'fix/{ISSUE}-crashlytics-production-{identity}'
     result = attempt_merge(github, job, bot_login='autofix[bot]')
     assert result['outcome'] == 'blocked'
+    assert github.merged_sha is None
+
+
+def test_check_run_for_different_target_base_does_not_authorize_merge(monkeypatch):
+    github, job, _ = setup(monkeypatch)
+    github.workflow_runs[0]['pull_requests'][0]['base']['sha'] = 'c' * 40
+    result = attempt_merge(github, job, bot_login='autofix[bot]')
+    assert result['outcome'] == 'pending'
+    assert github.merged_sha is None
+
+
+def test_applicable_external_failed_check_remains_pending(monkeypatch):
+    github, job, _ = setup(monkeypatch)
+    branch = github.pr['head']['ref']
+    github.external_check_runs = [{
+        'id': 900, 'name': 'SonarCloud Code Analysis', 'head_sha': HEAD,
+        'status': 'completed', 'conclusion': 'failure',
+        'app': {'slug': 'sonarcloud'},
+        'pull_requests': [{
+            'number': 12, 'head': {'ref': branch, 'sha': HEAD},
+            'base': {'ref': 'production', 'sha': BASE},
+        }],
+    }]
+    result = attempt_merge(github, job, bot_login='autofix[bot]')
+    assert result['outcome'] == 'pending'
+    assert github.merged_sha is None
+
+
+def test_sibling_only_external_failure_does_not_block_this_target(monkeypatch):
+    github, job, _ = setup(monkeypatch)
+    branch = github.peer['head']['ref']
+    github.external_check_runs = [{
+        'id': 901, 'name': 'CodeRabbit', 'head_sha': HEAD,
+        'status': 'completed', 'conclusion': 'failure',
+        'app': {'slug': 'coderabbitai'},
+        'pull_requests': [{
+            'number': 13, 'head': {'ref': branch, 'sha': HEAD},
+            'base': {'ref': 'develop', 'sha': BASE},
+        }],
+    }]
+    result = attempt_merge(github, job, bot_login='autofix[bot]')
+    assert result == {'outcome': 'merged', 'complete': False}
+    assert github.merged_sha == HEAD
+
+
+def test_same_sha_actions_run_from_old_target_branch_cannot_authorize_new_pr(monkeypatch):
+    github, job, _ = setup(monkeypatch)
+    identity = identity_hash_for(ALERT.issue_id, RELEASE)
+    github.workflow_runs[0]['head_branch'] = f'fix/{ISSUE}-crashlytics-production-{identity}'
+    result = attempt_merge(github, job, bot_login='autofix[bot]')
+    assert result['outcome'] == 'pending'
     assert github.merged_sha is None
 
 

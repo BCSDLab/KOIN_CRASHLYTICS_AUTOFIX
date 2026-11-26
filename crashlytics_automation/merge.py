@@ -1,34 +1,26 @@
 """Merge only the exact candidate after the required CI checks succeed.
 
-Each issue has two hotfix pull requests, one per release lane. ``production``
-may merge as soon as its own gate passes; ``develop`` must wait until the
-``production`` pull request is merged. Only a validated merge of the current
-pull request whose scheduled peer is also confirmed merged reports
-``complete``, which is what authorizes closing the issue.
+Each issue has two pull requests on one shared fix branch. ``production`` may
+merge as soon as its own gate passes; ``develop`` waits for production.
 """
 
 from __future__ import annotations
 
 import base64
 import binascii
-import re
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
-from .candidate import MAX_FILE_BYTES, MAX_TOTAL_BYTES, branch_name_for, manifest_digest, sha256, validate_manifest
+from .candidate import (
+    MAX_FILE_BYTES, MAX_TOTAL_BYTES, SHARED_FIX_BRANCH, branch_name_for,
+    manifest_digest, sha256, validate_manifest,
+)
 from .github import OWNER, REPO, REPOSITORY_PATH
 from .investigation_jobs import InvestigationQueue
 from .pull_requests import CLOSURE_REFERENCE
-from .repository import TARGET_BRANCHES
 from .task_payloads import validate_merge_task
 
 PEER_BRANCH = {'production': 'develop', 'develop': 'production'}
-LEGACY_HOTFIX_BRANCH = re.compile(
-    rf'hotfix/({"|".join(map(re.escape, TARGET_BRANCHES))})/crashlytics-([0-9a-f]{{64}})'
-)
-FIX_BRANCH = re.compile(
-    rf'fix/([1-9][0-9]*)-crashlytics-({"|".join(map(re.escape, TARGET_BRANCHES))})-([0-9a-f]{{64}})'
-)
 REQUIRED_CHECKS = ('Lint & Format Check', 'Code Coverage')
 FAILED_CONCLUSIONS = {'failure', 'timed_out', 'cancelled', 'action_required', 'startup_failure'}
 
@@ -121,30 +113,141 @@ def _verify_changes(github: Any, pr: dict[str, Any], manifest: dict[str, Any],
     return None
 
 
-def _verify_checks(github: Any, head_sha: str) -> dict[str, str] | None:
-    runs = _pages(github, f'{REPOSITORY_PATH}/commits/{head_sha}/check-runs?filter=latest', 'check_runs')
-    latest: dict[str, dict[str, Any]] = {}
+def _matching_pull_request_context(value: dict[str, Any], pr_number: int,
+                                  head_sha: str, head_branch: str,
+                                  target: str, base_sha: str) -> bool:
+    pulls = value.get('pull_requests')
+    if not isinstance(pulls, list):
+        return False
+    matches = []
+    for pull in pulls:
+        if not isinstance(pull, dict) or pull.get('number') != pr_number:
+            continue
+        base = pull.get('base') if isinstance(pull.get('base'), dict) else {}
+        head = pull.get('head') if isinstance(pull.get('head'), dict) else {}
+        matches.append(
+            head.get('sha') == head_sha and head.get('ref') == head_branch
+            and base.get('ref') == target and base.get('sha') == base_sha
+        )
+    return len(matches) == 1 and matches[0]
+
+
+def _run_pull_request(run: dict[str, Any], pr_number: int, head_sha: str,
+                      head_branch: str, target: str, base_sha: str) -> bool:
+    return (run.get('head_branch') == head_branch
+            and _matching_pull_request_context(run, pr_number, head_sha, head_branch, target, base_sha))
+
+def _verify_checks(github: Any, head_sha: str, head_branch: str, pr_number: int,
+                   target: str, base_sha: str) -> dict[str, str] | None:
+    """Verify checks from the latest PR-specific workflow runs."""
+    runs = _pages(
+        github, f'{REPOSITORY_PATH}/actions/runs?head_sha={head_sha}', 'workflow_runs',
+    )
+    matching = []
     for run in runs:
-        if run.get('head_sha') != head_sha or not isinstance(run.get('name'), str) or type(run.get('id')) is not int:
-            return _blocked('check run does not identify the exact pull request head')
-        previous = latest.get(run['name'])
-        if previous is None or run['id'] > previous['id']:
-            latest[run['name']] = run
+        if not isinstance(run, dict):
+            return _pending('workflow run metadata is invalid')
+        if run.get('head_sha') != head_sha:
+            return _blocked('workflow run does not identify the exact pull request head')
+        if not _run_pull_request(run, pr_number, head_sha, head_branch, target, base_sha):
+            continue
+        repository = run.get('repository') if isinstance(run.get('repository'), dict) else {}
+        head_repository = run.get('head_repository') if isinstance(run.get('head_repository'), dict) else {}
+        if repository.get('full_name') != f'{OWNER}/{REPO}' \
+                or head_repository.get('full_name') != f'{OWNER}/{REPO}':
+            return _blocked('workflow run is not from the configured repository')
+        if (type(run.get('id')) is not int or type(run.get('workflow_id')) is not int
+                or type(run.get('run_number')) is not int or type(run.get('run_attempt')) is not int
+                or type(run.get('check_suite_id')) is not int):
+            return _pending('workflow run is missing immutable PR context')
+        matching.append(run)
+    if not matching:
+        return _pending('target-specific workflow run has not reported yet')
+
+    latest: dict[int, dict[str, Any]] = {}
+    for run in matching:
+        workflow_id = run['workflow_id']
+        previous = latest.get(workflow_id)
+        if previous is None or (run['run_number'], run['run_attempt'], run['id']) > (
+            previous['run_number'], previous['run_attempt'], previous['id'],
+        ):
+            latest[workflow_id] = run
+
+    observed: dict[str, dict[str, Any]] = {}
+    for run in latest.values():
+        jobs = _pages(
+            github, f"{REPOSITORY_PATH}/actions/runs/{run['id']}/jobs?filter=latest", 'jobs',
+        )
+        for job in jobs:
+            if not isinstance(job, dict):
+                return _pending('workflow job metadata is invalid')
+            name = job.get('name')
+            if not isinstance(name, str):
+                return _blocked('workflow job has no check name')
+            if type(job.get('run_id')) is not int or job['run_id'] != run['id']:
+                return _blocked('workflow job does not identify its exact workflow run')
+            check_url = job.get('check_run_url')
+            expected_prefix = f'{REPOSITORY_PATH}/check-runs/'
+            parsed = urlsplit(check_url) if isinstance(check_url, str) else None
+            if (parsed is None or not parsed.path.startswith(expected_prefix)
+                    or not parsed.path[len(expected_prefix):].isdigit()):
+                return _blocked('workflow job has an invalid check-run link')
+            check = github.rest('GET', parsed.path)
+            if (not isinstance(check, dict) or check.get('name') != name
+                    or check.get('head_sha') != head_sha
+                    or (check.get('check_suite') or {}).get('id') != run['check_suite_id']):
+                return _blocked('check run does not identify the exact workflow run')
+            if name in REQUIRED_CHECKS and (check.get('app') or {}).get('slug') != 'github-actions':
+                return _blocked(f'required check has an unexpected publisher: {name}')
+            if name in observed and name in REQUIRED_CHECKS:
+                return _pending(f'required check has ambiguous workflow context: {name}')
+            observed[name] = job
+            if job.get('status') != 'completed':
+                return _pending(f'check is still running: {name}')
+            if job.get('conclusion') in FAILED_CONCLUSIONS:
+                return _pending(f'check failed: {name}')
     for name in REQUIRED_CHECKS:
-        run = latest.get(name)
-        if run is None:
+        job = observed.get(name)
+        if job is None:
             return _pending(f'required check has not reported yet: {name}')
-        if (run.get('app') or {}).get('slug') != 'github-actions':
-            return _blocked(f'required check has an unexpected publisher: {name}')
-        if run.get('status') != 'completed':
-            return _pending(f'required check is still running: {name}')
-        if run.get('conclusion') != 'success':
+        if job.get('conclusion') != 'success':
             return _pending(f'required check did not succeed: {name}')
-    for name, run in latest.items():
-        if run.get('conclusion') in FAILED_CONCLUSIONS:
-            return _pending(f'check failed: {name}')
-        if run.get('status') != 'completed':
-            return _pending(f'check is still running: {name}')
+
+    check_runs = _pages(
+        github, f'{REPOSITORY_PATH}/commits/{head_sha}/check-runs?filter=all', 'check_runs',
+    )
+    latest_external: dict[tuple[str, str], dict[str, Any]] = {}
+    for check in check_runs:
+        if not isinstance(check, dict) or check.get('head_sha') != head_sha:
+            return _blocked('check run does not identify the exact pull request head')
+        app = check.get('app') if isinstance(check.get('app'), dict) else {}
+        if app.get('slug') == 'github-actions':
+            continue
+        pulls = check.get('pull_requests')
+        if not isinstance(pulls, list) or not pulls:
+            if check.get('status') != 'completed' or check.get('conclusion') in FAILED_CONCLUSIONS:
+                return _pending('unbound external check is failed or pending')
+            continue
+        if not any(isinstance(pull, dict) and pull.get('number') == pr_number for pull in pulls):
+            continue
+        name = check.get('name')
+        if not isinstance(name, str) or not isinstance(app.get('slug'), str) \
+                or type(check.get('id')) is not int:
+            return _pending('external check run is missing immutable context')
+        key = (app['slug'], name)
+        previous = latest_external.get(key)
+        if previous is None or check['id'] > previous['id']:
+            latest_external[key] = check
+    for check in latest_external.values():
+        if not _matching_pull_request_context(
+            check, pr_number, head_sha, head_branch, target, base_sha,
+        ):
+            return _pending('external check run has ambiguous target context')
+        if check.get('status') != 'completed':
+            return _pending(f"check is still running: {check['name']}")
+        if check.get('conclusion') in FAILED_CONCLUSIONS:
+            return _pending(f"check failed: {check['name']}")
+
     statuses = _pages(github, f'{REPOSITORY_PATH}/commits/{head_sha}/status', 'statuses')
     if any(status.get('state') in ('failure', 'error') for status in statuses):
         return _pending('a commit status failed')
@@ -152,38 +255,30 @@ def _verify_checks(github: Any, head_sha: str) -> dict[str, str] | None:
         return _pending('a commit status is pending or unknown')
     return None
 
-
 def _fixed_repository(pr: dict[str, Any]) -> bool:
     return all((pr.get(side) or {}).get('repo', {}).get('full_name') == f'{OWNER}/{REPO}' for side in ('head', 'base'))
 
 
 def _hotfix_identity(
-    pr: dict[str, Any], target: str, bot_login: str, issue_number: int,
+    pr: dict[str, Any], _target: str, bot_login: str, issue_number: int,
 ) -> str | None:
-    """Identify a current issue-scoped branch or a historical queued hotfix ref."""
+    """Identify the shared issue-scoped automation branch."""
     head = pr.get('head') if isinstance(pr.get('head'), dict) else {}
     branch = head.get('ref')
-    if (pr.get('user') or {}).get('login') != bot_login or not isinstance(branch, str):
+    match = SHARED_FIX_BRANCH.fullmatch(branch) if isinstance(branch, str) else None
+    if (pr.get('user') or {}).get('login') != bot_login or match is None:
         return None
-    current = FIX_BRANCH.fullmatch(branch)
-    if current is not None:
-        number = int(current[1])
-        identity_hash, branch_target = current[3], current[2]
-        if number != issue_number or branch_target != target \
-                or branch != branch_name_for(identity_hash, target, number):
-            return None
-        return identity_hash
-    legacy = LEGACY_HOTFIX_BRANCH.fullmatch(branch)
-    if legacy is not None and legacy[1] == target:
-        return legacy[2]
-    return None
+    if int(match[1]) != issue_number:
+        return None
+    identity_hash = match[2]
+    return identity_hash if branch == branch_name_for(identity_hash, issue_number) else None
 
 
-def _is_current_issue_branch(pr: dict[str, Any], target: str, issue_number: int) -> bool:
+def _is_current_issue_branch(pr: dict[str, Any], issue_number: int) -> bool:
     head = pr.get('head') if isinstance(pr.get('head'), dict) else {}
     branch = head.get('ref')
-    match = FIX_BRANCH.fullmatch(branch) if isinstance(branch, str) else None
-    return match is not None and int(match[1]) == issue_number and match[2] == target
+    match = SHARED_FIX_BRANCH.fullmatch(branch) if isinstance(branch, str) else None
+    return match is not None and int(match[1]) == issue_number
 
 
 def _verify_peer_pull(
@@ -258,7 +353,7 @@ def attempt_merge(github: Any, job: dict[str, Any], *, bot_login: str) -> dict[s
     if ref.get('object', {}).get('sha') != job['baseSha']:
         return _pending(f'{target} advanced after the merge was scheduled; a fresh candidate is required')
     try:
-        manifest = InvestigationQueue(github).get_publication(job['headSha'])
+        manifest = InvestigationQueue(github).get_publication(job['headSha'], target)
     except (ValueError, TypeError):
         return _blocked('candidate publication metadata is invalid or tampered')
     if manifest is None:
@@ -269,8 +364,8 @@ def attempt_merge(github: Any, job: dict[str, Any], *, bot_login: str) -> dict[s
         return _blocked('candidate publication metadata is invalid')
     if digest != job['manifestDigest']:
         return _blocked('candidate publication digest does not match the scheduled job')
-    is_current_branch = _is_current_issue_branch(pr, target, job['issueNumber'])
-    if is_current_branch != (manifest.get('version') == 3):
+    is_current_branch = _is_current_issue_branch(pr, job['issueNumber'])
+    if not is_current_branch or manifest.get('version') != 3:
         return _blocked('pull request branch and manifest versions do not match')
     expected_manifest = {
         'issueId': job['alert']['issueId'],
@@ -291,7 +386,9 @@ def attempt_merge(github: Any, job: dict[str, Any], *, bot_login: str) -> dict[s
         return _blocked('candidate commit does not originate from its pinned branch base')
     for problem in (
         lambda: _verify_changes(github, pr, manifest, job),
-        lambda: _verify_checks(github, job['headSha']),
+        lambda: _verify_checks(
+            github, job['headSha'], pr['head']['ref'], job['pullNumber'], target, job['baseSha'],
+        ),
     ):
         result = problem()
         if result:

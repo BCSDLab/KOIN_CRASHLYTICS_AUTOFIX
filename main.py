@@ -158,6 +158,6 @@ def generateCrashlyticsFix(request: tasks_fn.CallableRequest) -> dict[str, Any]:
 })
 def mergeCrashlyticsFix(request: tasks_fn.CallableRequest) -> dict[str, Any]:
     automation = CrashAutomation(
-        _github({'contents': 'write', 'issues': 'write', 'pull_requests': 'write', 'checks': 'read', 'statuses': 'read'}),
+        _github({'actions': 'read', 'contents': 'write', 'issues': 'write', 'pull_requests': 'write', 'checks': 'read', 'statuses': 'read'}),
         CONFIG,
     )

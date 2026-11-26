@@ -24,23 +24,25 @@ def _manifest():
     )
 
 
-def _pull():
+def _pull(base='production'):
+    from crashlytics_automation.candidate import branch_name_for
     return {
         'number': 17, 'merged': True,
-        'headRefName': f'fix/17-crashlytics-production-{IDENTITY}',
-        'headRefOid': HEAD, 'baseRefName': 'production',
+        'headRefName': branch_name_for(IDENTITY, 17),
+        'headRefOid': HEAD, 'baseRefName': base,
         'author': {'__typename': 'Bot', 'login': 'autofix'},
         'mergeCommit': {'oid': MERGE, 'parents': {
             'totalCount': 2, 'nodes': [{'oid': RELEASE}, {'oid': HEAD}],
         }},
     }
 
-
 @pytest.mark.parametrize('blamed', [HEAD, MERGE])
 def test_ai_ownership_uses_merged_pr_head_record_even_when_blame_is_merge_commit(monkeypatch, blamed):
+    calls = []
     class Store:
-        def get_publication(self, head):
-            return _manifest() if head == HEAD else None
+        def get_publication(self, head, base):
+            calls.append((head, base))
+            return _manifest() if head == HEAD and base == 'production' else None
 
     monkeypatch.setattr(ownership, '_associated_pulls', lambda *_args: [_pull()])
     monkeypatch.setattr('crashlytics_automation.investigation_jobs.InvestigationQueue', lambda _github: Store())
@@ -49,11 +51,26 @@ def test_ai_ownership_uses_merged_pr_head_record_even_when_blame_is_merge_commit
     assert found is not None
     assert found.pull_number == 17
     assert found.commit_sha == blamed
+    assert calls == [(HEAD, 'production')]
 
+
+def test_ai_ownership_uses_associated_pull_target_for_shared_branch(monkeypatch):
+    calls = []
+    class Store:
+        def get_publication(self, head, base):
+            calls.append((head, base))
+            return _manifest() if head == HEAD and base == 'develop' else None
+
+    monkeypatch.setattr(ownership, '_associated_pulls', lambda *_args: [_pull('develop')])
+    monkeypatch.setattr('crashlytics_automation.investigation_jobs.InvestigationQueue', lambda _github: Store())
+    source = SourceLocation(SOURCE_PATH, 1, RELEASE, HEAD, 'autofix[bot]')
+    found = ownership.find_ai_fix_for_line(object(), source, bot_logins=('autofix[bot]',))
+    assert found is not None
+    assert calls == [(HEAD, 'develop')]
 
 def test_missing_external_record_never_claims_ai_ownership(monkeypatch):
     class Store:
-        def get_publication(self, _head):
+        def get_publication(self, _head, _base):
             return None
 
     monkeypatch.setattr(ownership, '_associated_pulls', lambda *_args: [_pull()])

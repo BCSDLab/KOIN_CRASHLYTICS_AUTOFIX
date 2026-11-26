@@ -157,7 +157,7 @@ jobs:
           context=$(mktemp -d)
           docker build --file "$GITHUB_WORKSPACE/Dockerfile.investigation" --tag "$INVESTIGATION_IMAGE" "$context"
 
-      - name: Investigate, reproduce, verify and publish one target lane
+      - name: Investigate once, verify and publish both target PRs
         id: execute
         if: steps.queue.outputs.pending == 'true'
         env:
@@ -172,7 +172,7 @@ jobs:
           fi
           python -m crashlytics_automation.worker "${args[@]}"
 
-      - name: Find work remaining after this target lane
+      - name: Find remaining incident work
         if: success() && steps.execute.outcome == 'success'
         id: remaining
         run: python -m crashlytics_automation.worker --list-pending

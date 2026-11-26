@@ -55,19 +55,22 @@ def existing_fix(
         raise ValueError('Invalid production branch base SHA for autofix resume')
     identity_hash = identity_hash_for(alert.issue_id, release_sha)
     pull = find_target_pull_request(github, identity_hash, target, issue_number)
+    branch = branch_name_for(identity_hash, issue_number)
     head_sha = (pull.get('head') or {}).get('sha') if pull is not None else None
     if pull is not None and (not isinstance(head_sha, str) or not SHA40.fullmatch(head_sha)):
         return _review('기존 자동 수정 PR의 head SHA를 확인할 수 없습니다.')
     if pull is None:
-        head_sha = find_branch_head(github, branch_name_for(identity_hash, target, issue_number))
+        head_sha = find_branch_head(github, branch)
     if head_sha is None:
         return None
     try:
-        manifest = publication_store.get_publication(head_sha)
+        manifest = publication_store.get_publication(head_sha, target)
     except (ValueError, TypeError):
         return _review('기존 자동 수정 브랜치의 외부 검증 기록을 읽을 수 없습니다.')
     if not isinstance(manifest, dict):
-        return _review('기존 자동 수정 브랜치의 외부 검증 기록을 찾을 수 없습니다.')
+        if pull is None:
+            return None
+        return _review('기존 자동 수정 PR의 외부 검증 기록을 찾을 수 없습니다.')
     source_sha = manifest.get('sourceSha')
     manifest_branch_base_sha = manifest.get('branchBaseSha')
     if manifest.get('version') != 3 or manifest.get('issueNumber') != issue_number \

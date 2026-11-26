@@ -15,7 +15,7 @@ from .task_payloads import parse_alert_payload
 
 POLICY_VERSION = 2
 PROPOSAL_VERSION = 1
-PUBLICATION_VERSION = 1
+PUBLICATION_VERSION = 2
 MAX_PUBLICATION_BYTES = 64 * 1024
 DEFAULT_ATTEMPT_LIMIT = 3
 APPROVED_ATTEMPT_LIMIT = DEFAULT_ATTEMPT_LIMIT + 1
@@ -167,7 +167,7 @@ class InvestigationQueue:
             for entry in result['tree']
             if isinstance(entry, dict) and entry.get('type') == 'blob'
             and isinstance(entry.get('path'), str)
-            and re.fullmatch(r'(?:(?:jobs|pending|active|proposals)/[0-9a-f]{64}\.json|publications/[0-9a-f]{40}\.json)', entry['path'])
+            and re.fullmatch(r'(?:(?:jobs|pending|active|proposals)/[0-9a-f]{64}\.json|publications/[0-9a-f]{40}/(?:production|develop)\.json)', entry['path'])
             and isinstance(entry.get('sha'), str) and _SHA.fullmatch(entry['sha'])
         }
 
@@ -364,8 +364,9 @@ class InvestigationQueue:
             raise ValueError('Proposal must include a source change and regression test')
         return envelope
 
-    def _read_publication(self, head_sha: str, blob_sha: str) -> dict[str, Any]:
-        from .candidate import manifest_digest, validate_manifest
+    def _read_publication(self, head_sha: str, base_branch: str, blob_sha: str) -> dict[str, Any]:
+        from .candidate import manifest_digest, require_target_branch, validate_manifest
+        require_target_branch(base_branch)
         blob = self.github.rest('GET', f'{REPOSITORY_PATH}/git/blobs/{blob_sha}')
         encoded = blob.get('content') if isinstance(blob, dict) and blob.get('encoding') == 'base64' else None
         if not isinstance(encoded, str) or len(encoded) > MAX_PUBLICATION_BYTES * 2:
@@ -374,28 +375,37 @@ class InvestigationQueue:
         if len(raw) > MAX_PUBLICATION_BYTES:
             raise ValueError('Publication record is too large')
         record = json.loads(raw.decode('utf-8'))
-        if not isinstance(record, dict) or set(record) != {'version', 'headSha', 'manifest', 'manifestDigest'}:
+        if not isinstance(record, dict) or set(record) != {
+            'version', 'headSha', 'baseBranch', 'manifest', 'manifestDigest',
+        }:
             raise ValueError('Malformed publication record')
-        if type(record['version']) is not int or record['version'] != PUBLICATION_VERSION or record['headSha'] != head_sha:
-            raise ValueError('Publication record is bound to a different head')
+        if (
+            type(record['version']) is not int or record['version'] != PUBLICATION_VERSION
+            or record['headSha'] != head_sha or record['baseBranch'] != base_branch
+        ):
+            raise ValueError('Publication record is bound to a different target or head')
         manifest = record['manifest']
         if not validate_manifest(manifest)['valid'] or record['manifestDigest'] != manifest_digest(manifest):
             raise ValueError('Publication record content or digest is invalid')
         return manifest
 
-    def get_publication(self, head_sha: str) -> dict[str, Any] | None:
+    def get_publication(self, head_sha: str, base_branch: str) -> dict[str, Any] | None:
+        from .candidate import require_target_branch
+        require_target_branch(base_branch)
         if not isinstance(head_sha, str) or _SHA.fullmatch(head_sha) is None:
             raise ValueError('Invalid publication head')
-        blob = self._entries(self._written_head or self._head()).get(f'publications/{head_sha}.json')
-        return self._read_publication(head_sha, blob) if blob is not None else None
+        path = f'publications/{head_sha}/{base_branch}.json'
+        blob = self._entries(self._written_head or self._head()).get(path)
+        return self._read_publication(head_sha, base_branch, blob) if blob is not None else None
 
-    def put_publication(self, head_sha: str, manifest: dict[str, Any]) -> None:
-        from .candidate import canonical_json, manifest_digest, validate_manifest
+    def put_publication(self, head_sha: str, base_branch: str, manifest: dict[str, Any]) -> None:
+        from .candidate import canonical_json, manifest_digest, require_target_branch, validate_manifest
+        require_target_branch(base_branch)
         if not isinstance(head_sha, str) or _SHA.fullmatch(head_sha) is None or not validate_manifest(manifest)['valid']:
             raise ValueError('Invalid publication identity or manifest')
         raw = canonical_json({
-            'version': PUBLICATION_VERSION, 'headSha': head_sha, 'manifest': manifest,
-            'manifestDigest': manifest_digest(manifest),
+            'version': PUBLICATION_VERSION, 'headSha': head_sha, 'baseBranch': base_branch,
+            'manifest': manifest, 'manifestDigest': manifest_digest(manifest),
         }).encode('utf-8')
         if len(raw) > MAX_PUBLICATION_BYTES:
             raise ValueError('Publication record is too large')
@@ -405,18 +415,18 @@ class InvestigationQueue:
         blob_sha = blob.get('sha') if isinstance(blob, dict) else None
         if not isinstance(blob_sha, str) or _SHA.fullmatch(blob_sha) is None:
             raise ValueError('Invalid publication blob SHA')
-        path = f'publications/{head_sha}.json'
+        path = f'publications/{head_sha}/{base_branch}.json'
         for attempt in range(3):
             head = self._written_head if attempt == 0 and self._written_head is not None else self._head()
             existing = self._entries(head).get(path)
             if existing is not None:
-                if self._read_publication(head_sha, existing) != manifest:
-                    raise JobConflict('Publication head already has a different verification record')
+                if self._read_publication(head_sha, base_branch, existing) != manifest:
+                    raise JobConflict('Publication head and target already have a different verification record')
                 return
             try:
                 self._written_head = self._advance_head(
                     head, [{'path': path, 'mode': '100644', 'type': 'blob', 'sha': blob_sha}],
-                    f'Publication {head_sha[:12]}',
+                    f'Publication {head_sha[:12]} {base_branch}',
                 )
                 return
             except Exception as error:

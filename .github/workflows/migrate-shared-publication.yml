@@ -1,0 +1,38 @@
+name: Migrate shared fix publication
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_metadata_sha:
+        description: Immutable pre-cutover metadata commit containing the verified legacy publications
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: migrate-shared-fix-publication
+  cancel-in-progress: false
+
+jobs:
+  migrate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      CRASHLYTICS_ENV: ${{ secrets.CRASHLYTICS_ENV }}
+      CRASHLYTICS_GITHUB_APP_PRIVATE_KEY: ${{ secrets.CRASHLYTICS_GITHUB_APP_PRIVATE_KEY }}
+      SOURCE_METADATA_SHA: ${{ inputs.source_metadata_sha }}
+      CRASHLYTICS_OPENAI_API_KEY: ''
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+      - name: Install trusted publication dependencies
+        run: python -m pip install --disable-pip-version-check --require-hashes -r requirements.txt
+      - name: Migrate verified publications without investigation or merge
+        run: python -m scripts.migrate_shared_publication

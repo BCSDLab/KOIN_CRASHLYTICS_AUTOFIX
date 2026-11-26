@@ -2,6 +2,7 @@ import hashlib
 
 from crashlytics_automation import fix_generation
 from crashlytics_automation.candidate import (
+    SHARED_FIX_BRANCH,
     branch_name_for,
     candidate_manifest,
     identity_hash_for,
@@ -21,15 +22,15 @@ class PublicationStore:
         self.fail = fail
         self.events = []
 
-    def put_publication(self, head_sha, manifest):
-        self.events.append(('put', head_sha))
+    def put_publication(self, head_sha, base_branch, manifest):
+        self.events.append(('put', head_sha, base_branch))
         if self.fail:
             raise ValueError('metadata unavailable')
-        self.records[head_sha] = manifest
+        self.records[(head_sha, base_branch)] = manifest
 
-    def get_publication(self, head_sha):
-        self.events.append(('get', head_sha))
-        return self.records.get(head_sha, self.record)
+    def get_publication(self, head_sha, base_branch):
+        self.events.append(('get', head_sha, base_branch))
+        return self.records.get((head_sha, base_branch), self.record)
 
 
 ALERT = CrashAlert('crash-1', '1.2.3', 'event-1', '2026-01-01', 'Crash', 'detail')
@@ -197,7 +198,12 @@ def test_source_release_changes_branch_test_and_manifest_identity():
     first = identity_hash_for(ALERT.issue_id, RELEASE_SHA)
     second = identity_hash_for(ALERT.issue_id, OTHER_RELEASE_SHA)
     assert first != second
-    assert branch_name_for(first, 'production', 1) != branch_name_for(second, 'production', 1)
+    branch = branch_name_for(first, 1)
+    match = SHARED_FIX_BRANCH.fullmatch(branch)
+    assert match is not None
+    assert match.group('issueNumber') == '1'
+    assert match.group('identityHash') == first
+    assert branch_name_for(first, 1) != branch_name_for(second, 1)
     assert regression_test_name(first) != regression_test_name(second)
     assert not is_allowed_test_path(
         f'domain/src/test/java/org/koin/{regression_test_name(first)}', second,
@@ -293,10 +299,15 @@ def test_develop_publication_commits_production_tree_but_targets_develop():
     calls = []
 
     class Github:
+        class Missing(Exception):
+            status = 404
+
         def rest(self, method, path, data=None):
             calls.append((method, path, data))
             if method == 'GET' and path.endswith(f'/git/commits/{BRANCH_BASE_SHA}'):
                 return {'tree': {'sha': '1' * 40}}
+            if method == 'GET' and path.startswith('/repos/') and '/git/ref/heads/' in path:
+                raise self.Missing()
             if method == 'POST' and path.endswith('/git/blobs'):
                 return {'sha': '2' * 40}
             if method == 'POST' and path.endswith('/git/trees'):
@@ -329,15 +340,137 @@ def test_develop_publication_commits_production_tree_but_targets_develop():
     assert {entry['path'] for entry in tree_call[2]['tree']} == {SOURCE_PATH, TEST_PATH}
     commit_call = next(call for call in calls if call[1].endswith('/git/commits'))
     assert commit_call[2]['parents'] == [BRANCH_BASE_SHA]
-    assert f'Crashlytics-Verification: {result.manifest_digest}' in commit_call[2]['message']
     ref_call = next(call for call in calls if call[1].endswith('/git/refs'))
-    assert ref_call[2]['ref'] == f'refs/heads/fix/17-crashlytics-develop-{IDENTITY_HASH}'
+    assert ref_call[2]['ref'] == f'refs/heads/{branch_name_for(IDENTITY_HASH, 17)}'
     pull_call = next(call for call in calls if call[1].endswith('/pulls'))
     assert pull_call[2]['base'] == 'develop'
-    assert pull_call[2]['head'] == f'fix/17-crashlytics-develop-{IDENTITY_HASH}'
+    assert pull_call[2]['head'] == branch_name_for(IDENTITY_HASH, 17)
+    assert pull_call[2]['draft'] is False
     assert 'manifest' not in pull_call[2]['body'].lower()
-    assert store.events[0] == ('put', result.head_sha)
+    assert store.events[0] == ('put', result.head_sha, 'develop')
 
+
+def test_shared_publication_reuses_one_head_for_both_targets_and_rejects_mismatch():
+    from base64 import b64encode
+
+    class Github:
+        class Missing(Exception):
+            status = 404
+
+        def __init__(self):
+            self.branch_head = None
+            self.commits = {}
+            self.files = {}
+            self.pulls = []
+            self.commit_posts = 0
+            self.ref_posts = 0
+
+        def rest(self, method, path, data=None):
+            if method == 'GET' and path.endswith(f'/git/commits/{BRANCH_BASE_SHA}'):
+                return {'tree': {'sha': '1' * 40}}
+            if method == 'GET' and path.endswith(f'/git/commits/{self.branch_head}'):
+                return self.commits[self.branch_head]
+            if method == 'GET' and '/git/ref/heads/' in path:
+                if self.branch_head is None:
+                    raise self.Missing()
+                return {'object': {'sha': self.branch_head}}
+            if method == 'POST' and path.endswith('/git/blobs'):
+                raw = __import__('base64').b64decode(data['content'])
+                return {'sha': hashlib.sha1(raw).hexdigest()}
+            if method == 'POST' and path.endswith('/git/trees'):
+                entries = sorted((entry['path'], entry['sha']) for entry in data['tree'])
+                return {'sha': hashlib.sha1(repr(entries).encode()).hexdigest()}
+            if method == 'POST' and path.endswith('/git/commits'):
+                self.commit_posts += 1
+                head = '4' * 40
+                self.commits[head] = {
+                    'parents': [{'sha': data['parents'][0]}],
+                    'tree': {'sha': data['tree']},
+                }
+                return {'sha': head}
+            if method == 'POST' and path.endswith('/git/refs'):
+                self.ref_posts += 1
+                self.branch_head = data['sha']
+                return {}
+            if method == 'GET' and path.endswith(f'/commits/{self.branch_head}'):
+                return self.commits[self.branch_head]
+            if method == 'GET' and '/contents/' in path:
+                file_path = path.split('/contents/', 1)[1].split('?ref=', 1)[0]
+                content = self.files[file_path]
+                return {
+                    'type': 'file', 'encoding': 'base64',
+                    'content': b64encode(content.encode()).decode(),
+                }
+            if method == 'GET' and path.endswith('/pulls?head='):
+                return self.pulls
+            if method == 'GET' and '/pulls?head=' in path:
+                return self.pulls
+            if method == 'POST' and path.endswith('/pulls'):
+                pull = {
+                    'number': len(self.pulls) + 1,
+                    'head': {'ref': data['head'], 'sha': self.branch_head,
+                             'repo': {'full_name': 'BCSDLab/KOIN_ANDROID'}},
+                    'base': {'ref': data['base'], 'repo': {'full_name': 'BCSDLab/KOIN_ANDROID'}},
+                    'user': {'login': 'autofix[bot]'},
+                    'state': 'open', 'merged': False, 'body': data['body'],
+                }
+                self.pulls.append(pull)
+                return pull
+            raise AssertionError((method, path, data))
+
+    def make_plan(base_sha, base_branch, test_content=TEST_CONTENT):
+        files = [
+            {'path': SOURCE_PATH, 'kind': 'source',
+             'beforeSha256': hashlib.sha256(SOURCE_BASE.encode()).hexdigest(),
+             'afterSha256': hashlib.sha256(SOURCE_AFTER.encode()).hexdigest()},
+            {'path': TEST_PATH, 'kind': 'test', 'beforeSha256': None,
+             'afterSha256': hashlib.sha256(test_content.encode()).hexdigest()},
+        ]
+        manifest = candidate_manifest(
+            issue_id=ALERT.issue_id, identity_hash=IDENTITY_HASH, issue_number=17,
+            base_sha=base_sha, branch_base_sha=BRANCH_BASE_SHA, source_sha=RELEASE_SHA,
+            source_path=SOURCE_PATH, files=files,
+        )
+        return FixPlan(
+            manifest=manifest,
+            changes=(FileChange(SOURCE_PATH, SOURCE_AFTER), FileChange(TEST_PATH, test_content)),
+            title='fix', issue_number=17, base_branch=base_branch,
+            branch_base_sha=BRANCH_BASE_SHA,
+        )
+
+    github = Github()
+    github.files = {SOURCE_PATH: SOURCE_AFTER, TEST_PATH: TEST_CONTENT}
+    store = PublicationStore()
+    production = publish_fix_pull_request(
+        github, plan=make_plan(BASE_SHA, 'production'),
+        bot_login='autofix[bot]', publication_store=store,
+    )
+    develop = publish_fix_pull_request(
+        github, plan=make_plan(DEVELOP_SHA, 'develop'),
+        bot_login='autofix[bot]', publication_store=store,
+    )
+    replay = publish_fix_pull_request(
+        github, plan=make_plan(BASE_SHA, 'production'),
+        bot_login='autofix[bot]', publication_store=store,
+    )
+
+    assert production.head_sha == develop.head_sha == replay.head_sha == '4' * 40
+    assert production.base_branch == 'production' and develop.base_branch == 'develop'
+    assert production.manifest_digest != develop.manifest_digest
+    assert github.commit_posts == 1
+    assert github.ref_posts == 1
+    assert [pull['head']['sha'] for pull in github.pulls] == ['4' * 40, '4' * 40]
+    assert [pull['head']['ref'] for pull in github.pulls] == [
+        branch_name_for(IDENTITY_HASH, 17), branch_name_for(IDENTITY_HASH, 17),
+    ]
+    assert [pull['base']['ref'] for pull in github.pulls] == ['production', 'develop']
+    assert replay.reused
+    mismatch = publish_fix_pull_request(
+        github, plan=make_plan(DEVELOP_SHA, 'develop', TEST_CONTENT + '// changed\n'),
+        bot_login='autofix[bot]', publication_store=store,
+    )
+    assert isinstance(mismatch, ManualReview)
+    assert github.commit_posts == 1 and github.ref_posts == 1
 
 def test_metadata_persistence_failure_blocks_branch_and_pull_request():
     manifest = candidate_manifest(
@@ -355,10 +488,15 @@ def test_metadata_persistence_failure_blocks_branch_and_pull_request():
     calls = []
 
     class Github:
+        class Missing(Exception):
+            status = 404
+
         def rest(self, method, path, data=None):
             calls.append((method, path, data))
             if method == 'GET' and path.endswith(f'/git/commits/{BRANCH_BASE_SHA}'):
                 return {'tree': {'sha': '1' * 40}}
+            if method == 'GET' and '/git/ref/heads/' in path:
+                raise self.Missing()
             if method == 'POST' and path.endswith('/git/blobs'):
                 return {'sha': '2' * 40}
             if method == 'POST' and path.endswith('/git/trees'):
@@ -390,7 +528,7 @@ def test_resume_refuses_missing_or_tampered_external_publication_record():
             raise AssertionError('an invalid external record must fail before GitHub lookups')
 
     class TamperedStore:
-        def get_publication(self, _head_sha):
+        def get_publication(self, _head_sha, _base_branch):
             raise ValueError('tampered publication record')
 
     for store in (PublicationStore(), TamperedStore()):

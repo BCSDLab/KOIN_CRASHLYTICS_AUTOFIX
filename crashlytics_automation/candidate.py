@@ -86,12 +86,16 @@ def require_target_branch(base_branch: Any) -> str:
     return base_branch
 
 
-def branch_name_for(identity_hash: Any, base_branch: Any, issue_number: Any) -> str:
-    target = require_target_branch(base_branch)
+SHARED_FIX_BRANCH = re.compile(
+    r'^fix/(?P<issueNumber>[1-9][0-9]*)-crashlytics-(?P<identityHash>[0-9a-f]{64})$'
+)
+
+
+def branch_name_for(identity_hash: Any, issue_number: Any) -> str:
     _require_identity_hash(identity_hash)
     if type(issue_number) is not int or not 0 < issue_number <= 2**53 - 1:
         raise TypeError('Invalid issue number')
-    return f'fix/{issue_number}-crashlytics-{target}-{identity_hash}'
+    return f'fix/{issue_number}-crashlytics-{identity_hash}'
 
 
 def regression_test_name(identity_hash: Any) -> str:

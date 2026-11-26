@@ -238,6 +238,8 @@ def _deliver(github: Any, queue: Any, job: dict[str, Any], config: dict[str, Any
         if fix is None or isinstance(fix, ManualReview) or fix.to_payload()['headSha'] != job['branches'][target]['headSha']:
             raise ValueError('Published PR changed before merge delivery')
         fixes.append(fix)
+    if len({fix.head_sha for fix in fixes}) != 1:
+        raise ValueError('Both target PRs must use the same verified source head')
     job['status'] = 'delivering'
     queue.put(job)
     for fix in fixes:
@@ -263,6 +265,107 @@ def _baseline(target: Path, files: list[dict[str, Any]], identity_hash: str) -> 
         if location.exists():
             result[path] = location.read_text(encoding='utf-8')
     return result
+
+
+def _validate_verified_checks(decision: dict[str, Any], verification: dict[str, Any]) -> None:
+    paths = {file['path'] for file in decision['files'] if file['kind'] == 'test'}
+    checks = verification.get('checks')
+    if verification.get('passed') is not True or not isinstance(checks, list) or not paths:
+        raise ValueError('Saved candidate has no complete trusted verification')
+    for path in paths:
+        before = [check for check in checks if check.get('path') == path and check.get('phase') == 'baseline']
+        after = [check for check in checks if check.get('path') == path and check.get('phase') == 'candidate']
+        if len(before) != 1 or len(after) != 1 or (
+            before[0].get('timed_out') is not False or before[0].get('exit_code') in (None, 0)
+            or before[0].get('test_result') not in ('failed', 'fatal-oom')
+            or after[0].get('timed_out') is not False or after[0].get('exit_code') != 0
+            or after[0].get('test_result') != 'passed'
+        ):
+            raise ValueError('Saved candidate lacks reproduced-before and passed-after evidence')
+
+
+def _verified_candidate(queue: Any, job: dict[str, Any], release: str, origin: str) -> Any:
+    from .models import SourceLocation
+    from .repository import TARGET_BRANCHES
+    record = job.get('verifiedProposal')
+    if record is None:
+        return None
+    if not isinstance(record, dict) or set(record) != {
+        'version', 'target', 'proposalSha', 'releaseSha', 'branchBaseSha', 'source', 'verification',
+    } or record['version'] != 1 or record['target'] not in TARGET_BRANCHES:
+        raise ValueError('Malformed verified proposal checkpoint')
+    target = record['target']
+    if record['releaseSha'] != release or record['branchBaseSha'] != origin or (
+        record['proposalSha'] != job.get('proposals', {}).get(target)
+        or job.get('verificationAttempts', {}).get(target, 0) < 1
+    ):
+        raise ValueError('Verified proposal checkpoint no longer matches the investigation')
+    checkpoint = queue.get_proposal(job, target)
+    if checkpoint is None or checkpoint['identity']['releaseSha'] != release or (
+        checkpoint['identity']['branchBaseSha'] != origin
+    ):
+        raise ValueError('Verified proposal content is unavailable or stale')
+    source = SourceLocation.from_payload(record['source'])
+    decision = checkpoint['proposal']
+    if source is None or source.release_sha != release or source.path != decision['sourcePath'] or (
+        source.line != decision['sourceLine']
+    ):
+        raise ValueError('Verified proposal source anchor changed')
+    verification = record['verification']
+    _validate_verified_checks(decision, verification)
+    return decision, verification, source
+
+
+def _publish_verified_targets(
+    github: Any, queue: Any, job: dict[str, Any], config: dict[str, Any],
+    release: str, origin: str, verified: Any,
+) -> dict[str, Any]:
+    from .fix_generation import existing_fix, publish_investigated_fix
+    from .models import ManualReview
+    from .pull_requests import branch_head_sha
+    from .repository import TARGET_BRANCHES
+    decision, verification, source = verified
+    context = _context(job)
+    published = {}
+    head = None
+    analysis_target = job['verifiedProposal']['target']
+    for target in TARGET_BRANCHES:
+        if branch_head_sha(github, 'production') != origin:
+            raise ValueError('Production origin changed before publishing both target PRs')
+        if target in job['branches']:
+            fix = existing_fix(
+                github, alert=context.alert, issue_number=context.issue_number,
+                base_branch=target, bot_login=config['botLogin'], release_sha=release,
+                branch_base_sha=origin, publication_store=queue,
+            )
+            if fix is None or isinstance(fix, ManualReview) or any(
+                fix.to_payload()[key] != job['branches'][target][key]
+                for key in ('pullNumber', 'headSha', 'baseSha', 'manifestDigest', 'baseBranch')
+            ):
+                raise ValueError('Previously published target PR changed')
+        else:
+            fix = publish_investigated_fix(
+                github, alert=context.alert, evidence=job['evidence'], decision=decision,
+                issue_number=context.issue_number, base_branch=target,
+                base_sha=branch_head_sha(github, target), branch_base_sha=origin,
+                release_sha=release, bot_login=config['botLogin'], verification=verification,
+                prior_bot_logins=config.get('priorBotLogins', ()), publication_store=queue,
+            )
+            if isinstance(fix, ManualReview):
+                raise ValueError(fix.reason)
+        if head is not None and head != fix.head_sha:
+            raise ValueError('Target PRs did not reuse the same source branch head')
+        head = fix.head_sha
+        published[target] = fix
+        job['branches'][target] = fix.to_payload()
+        job.setdefault('sources', {})[target] = source.to_payload()
+        job.setdefault('branchBases', {})[target] = origin
+        if target not in job['analyses']:
+            job['analyses'][target] = dict(job['analyses'][analysis_target])
+            job['analyses'][target]['verifiedFromTarget'] = analysis_target
+        job['status'] = 'delivering' if len(job['branches']) == len(TARGET_BRANCHES) else 'queued'
+        queue.put(job)
+    return published
 
 
 def run_job(github: Any, config: dict[str, Any], job: dict[str, Any]) -> dict[str, Any]:
@@ -329,6 +432,11 @@ def run_job(github: Any, config: dict[str, Any], job: dict[str, Any]) -> dict[st
         target_base = branch_head_sha(github, target)
         if checkpoint is not None and checkpoint['identity']['baseSha'] != target_base:
             raise ValueError('Saved proposal target base has changed')
+        verified = _verified_candidate(queue, job, release, origin)
+        if verified is not None:
+            _publish_verified_targets(github, queue, job, config, release, origin, verified)
+            _report(github, queue, job, config)
+            return _deliver(github, queue, job, config)
         resumed = existing_fix(github, alert=context.alert, issue_number=context.issue_number,
                                base_branch=target, bot_login=config['botLogin'], release_sha=release,
                                branch_base_sha=origin, publication_store=queue)
@@ -445,7 +553,7 @@ def run_job(github: Any, config: dict[str, Any], job: dict[str, Any]) -> dict[st
                             context={
                                 'issue': context.alert.to_payload(),
                                 'repository': REPOSITORY, 'releaseSha': release, 'baseBranch': 'production',
-                                'pullRequestTarget': target, 'pullRequestBaseSha': base,
+                                'pullRequestTargets': list(TARGET_BRANCHES),
                                 'operatorNotes': job.get('operatorNotes'),
                                 'priorInvestigations': job['analyses'],
                                 'baseSha': branch_base, 'crash': job['evidence'], 'identityHash': identity_hash,
@@ -518,22 +626,17 @@ def run_job(github: Any, config: dict[str, Any], job: dict[str, Any]) -> dict[st
                                                         path=decision['sourcePath'], line=decision['sourceLine'])
                     if isinstance(source, ManualReview):
                         raise ValueError(source.reason)
-                    job.setdefault('sources', {})[target] = source.to_payload()
+                    _validate_verified_checks(decision, verification)
                     job['analyses'][target]['source'] = f'{source.path}:{source.line}'
+                    job['verifiedProposal'] = {
+                        'version': 1, 'target': target, 'proposalSha': job['proposals'][target],
+                        'releaseSha': release, 'branchBaseSha': branch_base,
+                        'source': source.to_payload(), 'verification': _redact_diagnostic(verification),
+                    }
                     queue.put(job)
-                    published = publish_investigated_fix(
-                        github, alert=context.alert, evidence=job['evidence'], decision=decision,
-                        issue_number=context.issue_number, base_branch=target, base_sha=base,
-                        branch_base_sha=branch_base,
-                        release_sha=release, bot_login=config['botLogin'], verification=verification,
-                        prior_bot_logins=config.get('priorBotLogins', ()),
-                        publication_store=queue,
-                    )
-                    if isinstance(published, ManualReview):
-                        raise ValueError(published.reason)
-                    job['branches'][target] = published.to_payload()
-                    job['status'] = 'queued' if len(job['branches']) < len(TARGET_BRANCHES) else 'delivering'
-                    queue.put(job)
+                    verified = _verified_candidate(queue, job, release, branch_base)
+                    fixes = _publish_verified_targets(github, queue, job, config, release, branch_base, verified)
+                    published = fixes[target]
                     checkpointed = True
         if not checkpointed:
             job['branches'][target] = published.to_payload()
@@ -652,7 +755,8 @@ def main() -> int:
                 output.write(f'pending={"true" if jobs else "false"}\n')
                 output.write(f'issue_number={jobs[0]["issueNumber"] if jobs else ""}\n')
                 needs_sandbox = bool(jobs and jobs[0]['status'] in ('queued', 'running')
-                                     and any(branch not in jobs[0]['branches'] for branch in TARGET_BRANCHES))
+                                     and any(branch not in jobs[0]['branches'] for branch in TARGET_BRANCHES)
+                                     and jobs[0].get('verifiedProposal') is None)
                 output.write(f'needs_sandbox={"true" if needs_sandbox else "false"}\n')
         print(json.dumps({'pending': len(jobs)}))
         return 0

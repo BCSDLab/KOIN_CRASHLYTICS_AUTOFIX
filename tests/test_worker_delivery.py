@@ -63,7 +63,7 @@ class Github:
 
 
 def _fix(branch, number):
-    head = 'c' * 40 if branch == 'production' else 'd' * 40
+    head = 'c' * 40
     return PublishedFix(number, head, BASE_SHA, 'e' * 64, branch, reused=True)
 
 
@@ -336,27 +336,37 @@ def test_held_manual_job_with_both_publications_never_delivers(monkeypatch):
     assert queue.latest == job
 
 
-def test_retryable_verification_uses_checkpoint_without_model_recall(monkeypatch):
+@pytest.mark.parametrize('interruption', ['none', 'verification', 'publication'])
+def test_one_verified_fix_publishes_both_targets_and_recovers_without_reinvestigation(monkeypatch, interruption):
     from crashlytics_automation import issues
 
     identity = identity_hash_for(ALERT.issue_id, RELEASE_SHA)
     test_path = f'domain/src/test/kotlin/org/koin/{regression_test_name(identity)}'
-    source_before = 'package org.koin\nclass Thing { fun value() = 1 }\n'
     decision = {
-        'decision': 'fix',
-        'analysis': 'Observed behavior.',
-        'reason': 'Reproduced by the regression test.',
-        'sourcePath': SOURCE_PATH,
-        'sourceLine': 2,
+        'decision': 'fix', 'analysis': 'Observed before/after regression.', 'reason': 'Verified correction.',
+        'sourcePath': SOURCE_PATH, 'sourceLine': 2,
         'files': [
             {'path': SOURCE_PATH, 'content': 'package org.koin\nclass Thing { fun value() = 2 }\n'},
             {'path': test_path, 'content': (
-                'package org.koin\nimport org.junit.Test\nimport org.junit.Assert.assertTrue\n'
+                'package org.koin\nimport org.junit.Test\nimport org.junit.Assert.assertEquals\n'
                 + f'class {regression_test_name(identity)[:-3]} {{\n'
-                + '    @Test fun valueIsPositive() { assertTrue(Thing().value() > 0) }\n}\n'
+                + '    @Test fun valueMatchesExpected() { assertEquals(2, Thing().value()) }\n}\n'
             )},
         ],
     }
+    successful_verification = {
+        'passed': True, 'reason': 'all regressions reproduced and passed with candidate',
+        'checks': [
+            {'phase': 'baseline', 'path': test_path, 'exit_code': 1, 'timed_out': False,
+             'test_result': 'failed', 'evidence': {'source': 'junit-xml'}},
+            {'phase': 'candidate', 'path': test_path, 'exit_code': 0, 'timed_out': False,
+             'test_result': 'passed', 'evidence': {'source': 'junit-xml'}},
+        ],
+    }
+    verification_results = [successful_verification]
+    if interruption == 'verification':
+        verification_results.insert(0, {'passed': False, 'retryable': True, 'reason': 'verification command timed out'})
+    seen_candidates, sandbox_starts = [], []
 
     class CheckedOutGithub(Github):
         def checkout(self, sha, destination):
@@ -364,16 +374,11 @@ def test_retryable_verification_uses_checkpoint_without_model_recall(monkeypatch
             if sha == BASE_SHA:
                 source = destination / SOURCE_PATH
                 source.parent.mkdir(parents=True, exist_ok=True)
-                source.write_text(source_before, encoding='utf-8')
-
-    verification_results = [
-        {'passed': False, 'retryable': True, 'reason': 'verification command timed out'},
-        {'passed': True, 'reason': 'all regressions reproduced and passed with candidate'},
-    ]
-    seen_candidates = []
+                source.write_text('package org.koin\nclass Thing { fun value() = 1 }\n', encoding='utf-8')
 
     class RetrySandbox:
         def __init__(self, **kwargs):
+            sandbox_starts.append(True)
             self.artifact_directory = kwargs['target'].parent / 'artifacts'
             self.artifact_directory.mkdir(exist_ok=True)
 
@@ -384,7 +389,7 @@ def test_retryable_verification_uses_checkpoint_without_model_recall(monkeypatch
             return False
 
         def execute(self, **_kwargs):
-            raise AssertionError('provider proposal is stubbed')
+            raise AssertionError('unexpected additional investigation')
 
         def verify_candidate(self, *, files, **_kwargs):
             seen_candidates.append(copy.deepcopy(files))
@@ -392,19 +397,27 @@ def test_retryable_verification_uses_checkpoint_without_model_recall(monkeypatch
 
     queue = Queue()
     _patch_queue(monkeypatch, queue)
-    model_calls = []
-    publications = []
+    model_calls, merge_deliveries = [], []
+    publications = {}
+    publication_interrupted = False
+
+    def publish(_github, *, base_branch, base_sha, **_kwargs):
+        nonlocal publication_interrupted
+        if interruption == 'publication' and base_branch == 'develop' and not publication_interrupted:
+            publication_interrupted = True
+            raise Timeout('publication interrupted after the production PR')
+        fix = PublishedFix(24 if base_branch == 'production' else 25, 'c' * 40, base_sha, 'e' * 64, base_branch)
+        publications[base_branch] = fix
+        return fix
+
     monkeypatch.setattr(issues, 'verify_crash_issue', lambda *_a, **_k: None)
     monkeypatch.setattr(issues, 'record_fix_progress', lambda *_a, **_k: None)
     monkeypatch.setattr(issues, 'report_for_human',
-                        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError('infra retry held for human')))
-    monkeypatch.setattr('crashlytics_automation.fix_generation.existing_fix', lambda *_a, **_k: None)
-    monkeypatch.setattr(
-        'crashlytics_automation.fix_generation.publish_investigated_fix',
-        lambda *_args, **_kwargs: publications.append(True) or _fix('production', 24),
-    )
-    monkeypatch.setattr('crashlytics_automation.release_source.resolve_release_commit',
-                        lambda *_a, **_k: RELEASE_SHA)
+                        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError('automatic recovery became manual')))
+    monkeypatch.setattr('crashlytics_automation.fix_generation.existing_fix',
+                        lambda *_args, base_branch, **_kwargs: publications.get(base_branch))
+    monkeypatch.setattr('crashlytics_automation.fix_generation.publish_investigated_fix', publish)
+    monkeypatch.setattr('crashlytics_automation.release_source.resolve_release_commit', lambda *_a, **_k: RELEASE_SHA)
     monkeypatch.setattr('crashlytics_automation.release_source.resolve_investigated_source',
                         lambda *_args, **_kwargs: SourceLocation.from_payload(_source()))
     monkeypatch.setattr('crashlytics_automation.pull_requests.branch_head_sha',
@@ -412,23 +425,32 @@ def test_retryable_verification_uses_checkpoint_without_model_recall(monkeypatch
     monkeypatch.setattr('crashlytics_automation.openai_client.request_fix_proposal',
                         lambda **_kwargs: model_calls.append(True) or decision)
     monkeypatch.setattr('crashlytics_automation.sandbox.InvestigationSandbox', RetrySandbox)
+    monkeypatch.setattr(worker, 'enqueue_task',
+                        lambda _config, _function, _identity, data: merge_deliveries.append(data))
     monkeypatch.setenv('CRASHLYTICS_OPENAI_API_KEY', 'test-only')
 
-    first = worker.run_job(CheckedOutGithub(), {'botLogin': 'autofix[bot]'}, _base_job())
+    result = worker.run_job(CheckedOutGithub(), {'botLogin': 'autofix[bot]'}, _base_job())
     first_checkpoint = copy.deepcopy(queue.proposals['production'])
-    interrupted = copy.deepcopy(queue.latest)
-    interrupted['status'] = 'running'
-    queue.put(interrupted)
-    second = worker.run_job(CheckedOutGithub(), {'botLogin': 'autofix[bot]'}, copy.deepcopy(queue.latest))
+    if interruption != 'none':
+        assert result['outcome'] == 'queued'
+        assert merge_deliveries == []
+        result = worker.run_job(CheckedOutGithub(), {'botLogin': 'autofix[bot]'}, copy.deepcopy(queue.latest))
 
-    assert first['outcome'] == 'queued'
-    assert queue.latest['verificationAttempts']['production'] == 2
-    assert first_checkpoint == queue.proposals['production']
+    expected_verifications = 2 if interruption == 'verification' else 1
+    assert result == {'outcome': 'merging', 'issueNumber': 17}
     assert len(model_calls) == 1
-    assert seen_candidates[0] == seen_candidates[1]
-    assert second == {'outcome': 'queued', 'issueNumber': 17, 'baseBranch': 'production', 'pullNumber': 24}
-    assert queue.latest['branches']['production']['pullNumber'] == 24
-    assert len(publications) == 1
+    assert len(sandbox_starts) == expected_verifications
+    assert queue.latest['verificationAttempts'] == {'production': expected_verifications}
+    assert first_checkpoint == queue.proposals['production']
+    assert all(candidate == seen_candidates[0] for candidate in seen_candidates)
+    assert set(publications) == {'production', 'develop'}
+    assert {fix.head_sha for fix in publications.values()} == {'c' * 40}
+    assert publications['production'].base_sha == BASE_SHA
+    assert publications['develop'].base_sha == '9' * 40
+    assert {task['baseBranch'] for task in merge_deliveries} == {'production', 'develop'}
+    assert all(task['headSha'] == 'c' * 40 for task in merge_deliveries)
+
+
 
 
 @pytest.mark.parametrize('prior_attempts', [0, 3])

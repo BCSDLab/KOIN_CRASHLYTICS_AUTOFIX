@@ -167,7 +167,7 @@ def find_target_pull_request(
 ) -> dict[str, Any] | None:
     """The current-format PR for this release identity, issue and target."""
     target = require_target_branch(base_branch)
-    return _find_pull_request(github, branch_name_for(identity_hash, target, issue_number), target)
+    return _find_pull_request(github, branch_name_for(identity_hash, issue_number), target)
 
 
 def _pull_merged(pull: Mapping[str, Any]) -> bool:
@@ -183,7 +183,7 @@ def _verify_published_branch(
 ) -> tuple[dict[str, Any] | None, str | None]:
     """Trust a published branch only if its external record and content match."""
     try:
-        manifest = publication_store.get_publication(head_sha)
+        manifest = publication_store.get_publication(head_sha, expected['baseBranch'])
     except (ValueError, TypeError):
         return None, '외부 검증 기록이 손상되었습니다.'
     if not isinstance(manifest, dict):
@@ -191,20 +191,28 @@ def _verify_published_branch(
     validation = validate_manifest(manifest, expected)
     if not validation['valid']:
         return None, validation['reason']
-    # The candidate must still be based on the exact target commit recorded in its manifest.
+    # The candidate must still be based on the exact production commit.
+    branch_base_sha = manifest.get('branchBaseSha', manifest['baseSha'])
     commit = github.rest('GET', f'{REPOSITORY_PATH}/commits/{head_sha}')
     parents = commit.get('parents') if isinstance(commit, dict) else None
-    parent = parents[0].get('sha') if isinstance(parents, list) and parents \
-        and isinstance(parents[0], dict) else None
-    branch_base_sha = manifest.get('branchBaseSha', manifest['baseSha'])
-    if parent != branch_base_sha:
-        return None, '브랜치 커밋의 부모가 외부 검증 기록 기준 커밋과 다릅니다.'
+    if not isinstance(parents, list) or len(parents) != 1 \
+            or not isinstance(parents[0], dict) \
+            or parents[0].get('sha') != branch_base_sha:
+        return None, '브랜치 커밋의 단일 production 부모가 외부 검증 기록과 다릅니다.'
+    git_commit = github.rest('GET', f'{REPOSITORY_PATH}/git/commits/{head_sha}')
+    tree = git_commit.get('tree') if isinstance(git_commit, dict) else None
+    head_tree_sha = tree.get('sha') if isinstance(tree, dict) else None
+    changes = []
     for file in manifest['files']:
         content = read_repository_file(github, head_sha, file['path'])
         if content is None:
             return None, f'브랜치에 파일이 없습니다: {file["path"]}'
         if sha256(content) != file['afterSha256']:
             return None, f'브랜치 파일 해시가 외부 검증 기록과 다릅니다: {file["path"]}'
+        changes.append(FileChange(file['path'], content))
+    if not isinstance(head_tree_sha, str) or not SHA40.fullmatch(head_tree_sha) \
+            or _create_tree(github, branch_base_sha, changes) != head_tree_sha:
+        return None, '브랜치 전체 파일 tree가 production 기준과 정확한 계획에 일치하지 않습니다.'
     return manifest, None
 
 
@@ -247,7 +255,7 @@ def _commit_message(manifest: Mapping[str, Any], base_sha: str) -> str:
         f'fix: Crashlytics {manifest["issueId"]} 자동 수정 후보\n\n'
         f'기준 커밋: {base_sha}\n'
         f'회귀 테스트: {test_paths}\n\n'
-        f'Crashlytics-Verification: {manifest_digest(manifest)}\n'
+        f'Crashlytics-Fix: {manifest["identityHash"]}\n\n'
         '이 커밋은 자동 생성되었으며 필수 CI를 통과해야 합니다.'
     )
 
@@ -344,7 +352,7 @@ def _create_pull_request(
     identity_hash = manifest['identityHash']
     if manifest.get('issueNumber') != issue_number:
         return ManualReview('manifest의 이슈 번호가 PR 대상과 일치하지 않습니다.')
-    branch = branch_name_for(identity_hash, target, issue_number)
+    branch = branch_name_for(identity_hash, issue_number)
     try:
         pull: Any = github.rest(
             'POST',
@@ -407,6 +415,7 @@ def resume_fix_pull_request(
         source_path=source_path,
         branch_base_sha=branch_base_sha,
     )
+    expected['baseBranch'] = target
     manifest, failure = _verify_published_branch(
         github, head_sha, expected, publication_store,
     )
@@ -414,7 +423,7 @@ def resume_fix_pull_request(
         return ManualReview(
             f'기존 자동 수정 브랜치의 외부 검증 기록이 신뢰 기록과 일치하지 않습니다: {failure}'[:1000],
         )
-    branch = branch_name_for(identity_hash, target, issue_number)
+    branch = branch_name_for(identity_hash, issue_number)
     pull = _find_pull_request(github, branch, target, head_sha=head_sha)
     if pull is not None:
         mismatch = _pinned_pull_matches(
@@ -449,7 +458,7 @@ def resume_fix_pull_request(
 def publish_fix_pull_request(
     github: Any, *, plan: FixPlan, bot_login: str | None, publication_store: Any,
 ) -> PublishedFix | ManualReview:
-    """Commit only planned source/tests, persist metadata, then open the pull request."""
+    """Create or reuse the shared production-based source branch for one target."""
     manifest = plan.manifest
     base_branch = require_target_branch(plan.base_branch)
     validation = validate_manifest(manifest, {
@@ -462,43 +471,67 @@ def publish_fix_pull_request(
         return ManualReview('수정 manifest가 PR 대상 또는 production 기준과 일치하지 않습니다.')
     identity_hash = manifest['identityHash']
     branch_base_sha = manifest['branchBaseSha']
-    tree_sha = _create_tree(github, branch_base_sha, plan.changes)
-    commit_sha = _create_commit(github, manifest, branch_base_sha, tree_sha)
+    branch = branch_name_for(identity_hash, plan.issue_number)
+    expected_tree = _create_tree(github, branch_base_sha, plan.changes)
+    existing_head = find_branch_head(github, branch)
+    if existing_head is not None:
+        commit = github.rest('GET', f'{REPOSITORY_PATH}/commits/{existing_head}')
+        parents = commit.get('parents') if isinstance(commit, dict) else None
+        git_commit = github.rest('GET', f'{REPOSITORY_PATH}/git/commits/{existing_head}')
+        tree = git_commit.get('tree') if isinstance(git_commit, dict) else None
+        actual_tree = tree.get('sha') if isinstance(tree, dict) else None
+        if not isinstance(parents, list) or len(parents) != 1 \
+                or not isinstance(parents[0], dict) \
+                or parents[0].get('sha') != branch_base_sha \
+                or actual_tree != expected_tree:
+            return ManualReview('기존 공유 자동 수정 브랜치의 부모 또는 전체 파일 트리가 계획과 다릅니다.')
+        try:
+            publication_store.put_publication(existing_head, base_branch, manifest)
+        except Exception:  # noqa: BLE001 - metadata failure must block target PR publication
+            return ManualReview('외부 검증 기록을 저장할 수 없어 PR을 게시하지 않았습니다.')
+        return resume_fix_pull_request(
+            github, head_sha=existing_head, issue_id=manifest['issueId'],
+            identity_hash=identity_hash, source_sha=manifest['sourceSha'],
+            source_path=manifest['sourcePath'], branch_base_sha=branch_base_sha,
+            title=plan.title, issue_number=plan.issue_number, base_branch=base_branch,
+            bot_login=bot_login, publication_store=publication_store,
+        )
+
+    commit_sha = _create_commit(github, manifest, branch_base_sha, expected_tree)
     try:
-        publication_store.put_publication(commit_sha, manifest)
+        publication_store.put_publication(commit_sha, base_branch, manifest)
     except Exception:  # noqa: BLE001 - metadata failure must block branch publication
         return ManualReview('외부 검증 기록을 저장할 수 없어 PR을 게시하지 않았습니다.')
-
-    branch = branch_name_for(identity_hash, base_branch, plan.issue_number)
     try:
         github.rest(
-            'POST', f'{REPOSITORY_PATH}/git/refs', {'ref': f'refs/heads/{branch}', 'sha': commit_sha},
+            'POST', f'{REPOSITORY_PATH}/git/refs',
+            {'ref': f'refs/heads/{branch}', 'sha': commit_sha},
         )
-    except Exception as error:  # noqa: BLE001 - a 422 means a concurrent worker won the race
+    except Exception as error:  # noqa: BLE001 - another publisher may win branch creation
         if _status_of(error) != 422:
             raise
-        # A concurrent worker may have created the branch first; resume against it instead of charging again.
+        winner_sha = _branch_head_sha(github, branch)
+        winner_commit = github.rest('GET', f'{REPOSITORY_PATH}/commits/{winner_sha}')
+        parents = winner_commit.get('parents') if isinstance(winner_commit, dict) else None
+        git_commit = github.rest('GET', f'{REPOSITORY_PATH}/git/commits/{winner_sha}')
+        tree = git_commit.get('tree') if isinstance(git_commit, dict) else None
+        if not isinstance(parents, list) or len(parents) != 1 \
+                or not isinstance(parents[0], dict) \
+                or parents[0].get('sha') != branch_base_sha \
+                or not isinstance(tree, dict) or tree.get('sha') != expected_tree:
+            return ManualReview('경쟁 게시자가 만든 공유 브랜치가 검증된 수정 계획과 다릅니다.')
+        try:
+            publication_store.put_publication(winner_sha, base_branch, manifest)
+        except Exception:  # noqa: BLE001 - metadata failure must block target PR publication
+            return ManualReview('외부 검증 기록을 저장할 수 없어 PR을 게시하지 않았습니다.')
         return resume_fix_pull_request(
-            github,
-            head_sha=_branch_head_sha(github, branch),
-            issue_id=manifest['issueId'],
-            identity_hash=identity_hash,
-            source_sha=manifest['sourceSha'],
-            source_path=manifest['sourcePath'],
-            branch_base_sha=branch_base_sha,
-            title=plan.title,
-            issue_number=plan.issue_number,
-            base_branch=base_branch,
-            bot_login=bot_login,
-            publication_store=publication_store,
+            github, head_sha=winner_sha, issue_id=manifest['issueId'],
+            identity_hash=identity_hash, source_sha=manifest['sourceSha'],
+            source_path=manifest['sourcePath'], branch_base_sha=branch_base_sha,
+            title=plan.title, issue_number=plan.issue_number, base_branch=base_branch,
+            bot_login=bot_login, publication_store=publication_store,
         )
-
     return _create_pull_request(
-        github,
-        manifest=manifest,
-        head_sha=commit_sha,
-        title=plan.title,
-        issue_number=plan.issue_number,
-        base_branch=base_branch,
-        bot_login=bot_login,
+        github, manifest=manifest, head_sha=commit_sha, title=plan.title,
+        issue_number=plan.issue_number, base_branch=base_branch, bot_login=bot_login,
     )

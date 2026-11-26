@@ -75,12 +75,11 @@ def find_ai_fix_for_line(
 
     A pull request counts only when the blamed commit is its merge commit
     (historical squash) or its merged head (second parent), its head branch is
-    ``fix/<issue>-crashlytics-<target>-<identityHash>`` or a recognized historical
-    branch, its author is a
-    current or explicitly trusted former bot, and its head-bound external
-    publication record validates for that identity and lists the crashed file
-    as a modified source file. Anything else — unmerged PRs, other bots, human PRs,
-    unrelated files or revisions — is not proof.
+    ``fix/<issue>-crashlytics-<identityHash>`` or a recognized historical
+    branch, its author is a current or explicitly trusted former bot, and its
+    head-bound external publication record validates for that identity and PR
+    target and lists the crashed file as a modified source file. Anything else —
+    unmerged PRs, other bots, human PRs, unrelated files or revisions — is not proof.
     """
     if not isinstance(bot_logins, tuple) or not bot_logins:
         raise ValueError("Invalid bot logins")
@@ -101,9 +100,7 @@ def find_ai_fix_for_line(
         publication_head = pull.get("headRefOid")
         if not isinstance(publication_head, str) or re.fullmatch(r"[0-9a-f]{40}", publication_head) is None:
             raise RuntimeError("GitHub origin publication head is invalid")
-        if not _manifest_lists_crashed_file(
-            github, publication_head, identity_hash, source.path, head,
-        ):
+        if not _manifest_lists_crashed_file(github, publication_head, base, identity_hash, source.path, head):
             continue
         return MergedAiFix(pull_number=number, commit_sha=source.change_sha)
     return None
@@ -134,10 +131,14 @@ def _is_bot_author(author: object, app_logins: set[str]) -> bool:
 
 
 def _fix_branch_identity(head_ref: str, base_ref: object) -> str | None:
-    """Identity hash of a current or historical automation fix branch."""
-    current = _ISSUE_FIX_BRANCH.fullmatch(head_ref)
+    """Identity hash of a current shared or historical automation fix branch."""
+    from .candidate import SHARED_FIX_BRANCH
+    current = SHARED_FIX_BRANCH.fullmatch(head_ref)
     if current is not None:
-        return current.group(3) if base_ref == current.group(2) else None
+        return current.group('identityHash')
+    issue_target = _ISSUE_FIX_BRANCH.fullmatch(head_ref)
+    if issue_target is not None:
+        return issue_target.group(3) if base_ref == issue_target.group(2) else None
     hotfix = _HOTFIX_BRANCH.fullmatch(head_ref)
     if hotfix is not None:
         return hotfix.group(2) if base_ref == hotfix.group(1) else None
@@ -162,18 +163,24 @@ def _merge_commit_matches(merge_commit: object, change_sha: str) -> bool:
 def _manifest_lists_crashed_file(
     github: Any,
     revision: str,
+    base_branch: str,
     identity_hash: str,
     source_path: str,
     head_ref: str,
 ) -> bool:
-    """Validate the external verification record for the merged PR head."""
+    """Validate the external verification record for the merged PR head and target."""
     from .investigation_jobs import InvestigationQueue
-    manifest = InvestigationQueue(github).get_publication(revision)
+    manifest = InvestigationQueue(github).get_publication(revision, base_branch)
     if manifest is None or not validate_manifest(manifest, {"identityHash": identity_hash})["valid"]:
         return False
-    current = _ISSUE_FIX_BRANCH.fullmatch(head_ref)
-    if current is not None:
-        if manifest.get("version") != 3 or int(current.group(1)) != manifest.get("issueNumber"):
+    from .candidate import SHARED_FIX_BRANCH
+    shared = SHARED_FIX_BRANCH.fullmatch(head_ref)
+    historical_current = _ISSUE_FIX_BRANCH.fullmatch(head_ref)
+    if shared is not None:
+        if manifest.get("version") != 3 or int(shared.group('issueNumber')) != manifest.get("issueNumber"):
+            return False
+    elif historical_current is not None:
+        if manifest.get("version") != 3 or int(historical_current.group(1)) != manifest.get("issueNumber"):
             return False
     elif manifest.get("version") == 3:
         return False
