@@ -145,18 +145,14 @@ def main():
                     'filesDigest': proof_digest, 'sharedExactSourceProof': True,
                 }
                 queue.put(job)
-            for target in EXPECTED:
-                github.graphql('''mutation($pull:ID!) {
-                    markPullRequestReadyForReview(input:{pullRequestId:$pull}) { pullRequest { isDraft } }
-                }''', {'pull': pulls[target]['node_id']})
-            job['status'] = 'delivering'
+            job['status'] = 'manual'
             job['verificationResumeRequired'] = False
-            job.pop('reason', None)
+            job['reason'] = '사용자 요청에 따라 앱 PR만 정리했습니다. 기존 Maestro CI 오류는 범위 밖이며 자동 머지를 보류합니다.'
             job['reportPending'] = True
             queue.put(job)
             _report(github, queue, job, config)
-            print(json.dumps({'outcome': 'metadata-free-publications', 'branches': job['branches'],
-                              'modelAttempts': job['attempts'], 'proofFilesDigest': proof_digest}))
+            print(json.dumps({'outcome': 'metadata-free-publications-held', 'branches': job['branches'],
+                              'modelAttempts': job['attempts'], 'proofFilesDigest': proof_digest, 'draft': True}))
     except Exception as error:
         job['status'], job['reason'], job['reportPending'] = 'manual', str(error)[:1000], True
         queue.put(job)
