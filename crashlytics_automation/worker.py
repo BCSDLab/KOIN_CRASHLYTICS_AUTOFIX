@@ -235,7 +235,7 @@ def _deliver(github: Any, queue: Any, job: dict[str, Any], config: dict[str, Any
             raise ValueError('Published PR has no recorded production origin')
         fix = existing_fix(github, alert=context.alert, issue_number=context.issue_number,
                            base_branch=target, bot_login=config['botLogin'], release_sha=release,
-                           branch_base_sha=origin)
+                           branch_base_sha=origin, publication_store=queue)
         if fix is None or isinstance(fix, ManualReview) or fix.to_payload()['headSha'] != job['branches'][target]['headSha']:
             raise ValueError('Published PR changed before merge delivery')
         fixes.append(fix)
@@ -328,7 +328,7 @@ def run_job(github: Any, config: dict[str, Any], job: dict[str, Any]) -> dict[st
             raise ValueError('Saved proposal target base has changed')
         resumed = existing_fix(github, alert=context.alert, issue_number=context.issue_number,
                                base_branch=target, bot_login=config['botLogin'], release_sha=release,
-                               branch_base_sha=origin)
+                               branch_base_sha=origin, publication_store=queue)
         if isinstance(resumed, ManualReview):
             raise ValueError(resumed.reason)
         checkpointed = False
@@ -517,6 +517,7 @@ def run_job(github: Any, config: dict[str, Any], job: dict[str, Any]) -> dict[st
                         branch_base_sha=branch_base,
                         release_sha=release, bot_login=config['botLogin'], verification=verification,
                         prior_bot_logins=config.get('priorBotLogins', ()),
+                        publication_store=queue,
                     )
                     if isinstance(published, ManualReview):
                         raise ValueError(published.reason)

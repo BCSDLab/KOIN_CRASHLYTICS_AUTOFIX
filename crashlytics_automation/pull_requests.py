@@ -1,15 +1,13 @@
 """GitHub publication and resume verification for generated Crashlytics fix branches.
 
 Every write happens here: blobs -> tree -> commit -> branch -> pull request.
-The manifest committed with the branch is the exact trusted artifact, and a
-resumed branch is trusted only after its manifest and file bytes match it.
+Publication trust is persisted in the repository's external metadata store.
 """
 
 from __future__ import annotations
 
 import base64
 import binascii
-import json
 import re
 from typing import Any, Mapping, Sequence
 from urllib.parse import quote
@@ -17,9 +15,7 @@ from urllib.parse import quote
 from .candidate import (
     SHA40,
     branch_name_for,
-    manifest_bytes,
     manifest_digest,
-    manifest_path_for,
     require_target_branch,
     sha256,
     validate_manifest,
@@ -183,16 +179,15 @@ def _pull_merged(pull: Mapping[str, Any]) -> bool:
 
 
 def _verify_published_branch(
-    github: Any, head_sha: str, expected: Mapping[str, str],
+    github: Any, head_sha: str, expected: Mapping[str, str], publication_store: Any,
 ) -> tuple[dict[str, Any] | None, str | None]:
-    """Trust a published branch only if its manifest and content match the record."""
-    raw = read_repository_file(github, head_sha, manifest_path_for(expected['identityHash']))
-    if raw is None:
-        return None, '브랜치에서 manifest를 찾을 수 없습니다.'
+    """Trust a published branch only if its external record and content match."""
     try:
-        manifest = json.loads(raw)
-    except ValueError:
-        return None, '브랜치의 manifest가 올바른 JSON이 아닙니다.'
+        manifest = publication_store.get_publication(head_sha)
+    except (ValueError, TypeError):
+        return None, '외부 검증 기록이 손상되었습니다.'
+    if not isinstance(manifest, dict):
+        return None, '외부 검증 기록을 찾을 수 없습니다.'
     validation = validate_manifest(manifest, expected)
     if not validation['valid']:
         return None, validation['reason']
@@ -203,13 +198,13 @@ def _verify_published_branch(
         and isinstance(parents[0], dict) else None
     branch_base_sha = manifest.get('branchBaseSha', manifest['baseSha'])
     if parent != branch_base_sha:
-        return None, '브랜치 커밋의 부모가 manifest 기준 커밋과 다릅니다.'
+        return None, '브랜치 커밋의 부모가 외부 검증 기록 기준 커밋과 다릅니다.'
     for file in manifest['files']:
         content = read_repository_file(github, head_sha, file['path'])
         if content is None:
             return None, f'브랜치에 파일이 없습니다: {file["path"]}'
         if sha256(content) != file['afterSha256']:
-            return None, f'브랜치 파일 해시가 manifest와 다릅니다: {file["path"]}'
+            return None, f'브랜치 파일 해시가 외부 검증 기록과 다릅니다: {file["path"]}'
     return manifest, None
 
 
@@ -252,6 +247,7 @@ def _commit_message(manifest: Mapping[str, Any], base_sha: str) -> str:
         f'fix: Crashlytics {manifest["issueId"]} 자동 수정 후보\n\n'
         f'기준 커밋: {base_sha}\n'
         f'회귀 테스트: {test_paths}\n\n'
+        f'Crashlytics-Verification: {manifest_digest(manifest)}\n'
         '이 커밋은 자동 생성되었으며 필수 CI를 통과해야 합니다.'
     )
 
@@ -279,8 +275,7 @@ def _pull_request_body(
 * 대상 브랜치: `{base_branch}` @ `{manifest['baseSha']}`
 * 변경 기준: production @ `{manifest.get('branchBaseSha', manifest['baseSha'])}`
 * 발생 릴리스 소스: `{manifest['sourceSha']}` (`{safe_text(manifest['sourcePath'], 300)}`)
-* manifest: `{manifest_path_for(identity_hash)}`
-* manifestDigest: `{manifest_digest(manifest)}`
+* 검증 기록은 앱 브랜치가 아닌 비브랜치 상태 ref에 고정됩니다.
 
 ### 검증 필요 사항
 * 새 회귀 테스트는 수정된 동작을 일반 JUnit assertion으로 확인합니다.
@@ -400,6 +395,7 @@ def resume_fix_pull_request(
     issue_number: int,
     base_branch: str,
     bot_login: str | None,
+    publication_store: Any,
 ) -> PublishedFix | ManualReview:
     """Resume a current-format branch pinned to the same issue and release."""
     target = require_target_branch(base_branch)
@@ -411,10 +407,12 @@ def resume_fix_pull_request(
         source_path=source_path,
         branch_base_sha=branch_base_sha,
     )
-    manifest, failure = _verify_published_branch(github, head_sha, expected)
+    manifest, failure = _verify_published_branch(
+        github, head_sha, expected, publication_store,
+    )
     if manifest is None:
         return ManualReview(
-            f'기존 자동 수정 브랜치의 manifest가 신뢰 기록과 일치하지 않습니다: {failure}'[:1000],
+            f'기존 자동 수정 브랜치의 외부 검증 기록이 신뢰 기록과 일치하지 않습니다: {failure}'[:1000],
         )
     branch = branch_name_for(identity_hash, target, issue_number)
     pull = _find_pull_request(github, branch, target, head_sha=head_sha)
@@ -449,9 +447,9 @@ def resume_fix_pull_request(
 
 
 def publish_fix_pull_request(
-    github: Any, *, plan: FixPlan, bot_login: str | None,
+    github: Any, *, plan: FixPlan, bot_login: str | None, publication_store: Any,
 ) -> PublishedFix | ManualReview:
-    """Commit the validated changes plus manifest, then open the fix pull request."""
+    """Commit only planned source/tests, persist metadata, then open the pull request."""
     manifest = plan.manifest
     base_branch = require_target_branch(plan.base_branch)
     validation = validate_manifest(manifest, {
@@ -464,12 +462,12 @@ def publish_fix_pull_request(
         return ManualReview('수정 manifest가 PR 대상 또는 production 기준과 일치하지 않습니다.')
     identity_hash = manifest['identityHash']
     branch_base_sha = manifest['branchBaseSha']
-    changes = [
-        *plan.changes,
-        FileChange(manifest_path_for(identity_hash), manifest_bytes(manifest)),
-    ]
-    tree_sha = _create_tree(github, branch_base_sha, changes)
+    tree_sha = _create_tree(github, branch_base_sha, plan.changes)
     commit_sha = _create_commit(github, manifest, branch_base_sha, tree_sha)
+    try:
+        publication_store.put_publication(commit_sha, manifest)
+    except Exception:  # noqa: BLE001 - metadata failure must block branch publication
+        return ManualReview('외부 검증 기록을 저장할 수 없어 PR을 게시하지 않았습니다.')
 
     branch = branch_name_for(identity_hash, base_branch, plan.issue_number)
     try:
@@ -492,6 +490,7 @@ def publish_fix_pull_request(
             issue_number=plan.issue_number,
             base_branch=base_branch,
             bot_login=bot_login,
+            publication_store=publication_store,
         )
 
     return _create_pull_request(

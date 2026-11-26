@@ -1,0 +1,70 @@
+name: Repair verified crash publications
+
+on:
+  workflow_dispatch:
+    inputs:
+      proposal_b64:
+        description: Refined saved candidate, without generation
+        required: true
+        type: string
+      proposal_sha256:
+        description: SHA256 of the exact candidate payload
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  repair:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    concurrency:
+      group: crashlytics-investigation-worker
+      cancel-in-progress: false
+    env:
+      CRASHLYTICS_ENV: ${{ secrets.CRASHLYTICS_ENV }}
+      CRASHLYTICS_GITHUB_APP_PRIVATE_KEY: ${{ secrets.CRASHLYTICS_GITHUB_APP_PRIVATE_KEY }}
+      CRASHLYTICS_OPENAI_API_KEY: ''
+      PROPOSAL_B64: ${{ inputs.proposal_b64 }}
+      PROPOSAL_SHA256: ${{ inputs.proposal_sha256 }}
+      INVESTIGATION_IMAGE: crashlytics-investigator:${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+      - name: Install trusted dependencies
+        run: python -m pip install --disable-pip-version-check --require-hashes -r requirements.txt
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: ''
+          log-accepted-android-sdk-licenses: 'false'
+      - name: Install isolated verification prerequisites
+        run: |
+          sdkmanager 'platform-tools' 'emulator' 'platforms;android-36' 'build-tools;36.0.0' 'system-images;android-34;google_apis;x86_64'
+          test -c /dev/kvm
+          sudo chmod 0666 /dev/kvm
+      - name: Build credential-free verification image
+        run: |
+          context=$(mktemp -d)
+          docker build --file "$GITHUB_WORKSPACE/Dockerfile.investigation" --tag "$INVESTIGATION_IMAGE" "$context"
+      - name: Verify candidate and atomically replace owned publication heads
+        env:
+          INVESTIGATION_ARTIFACTS: ${{ runner.temp }}/crashlytics-artifacts
+        run: python -m scripts.repair_1789_publication
+      - name: Preserve verification artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crashlytics-publication-repair-${{ github.run_id }}
+          path: ${{ runner.temp }}/crashlytics-artifacts/**
+          if-no-files-found: ignore
+          retention-days: 7

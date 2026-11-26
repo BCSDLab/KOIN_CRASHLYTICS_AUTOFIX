@@ -82,7 +82,7 @@ jobs:
 
   investigate:
     needs: prepare
-    if: always() && (needs.prepare.result == 'success' || needs.prepare.result == 'skipped')
+    if: ${{ !cancelled() && (needs.prepare.result == 'success' || needs.prepare.result == 'skipped') }}
     concurrency:
       group: crashlytics-investigation-worker
       cancel-in-progress: false

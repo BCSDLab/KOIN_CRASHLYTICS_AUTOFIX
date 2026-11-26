@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import json
 import re
 from typing import Any, Mapping
 
 from .candidate import (
     SHA40, branch_name_for, candidate_manifest, identity_hash_for,
-    is_allowed_source_path, is_allowed_test_path, manifest_path_for,
+    is_allowed_source_path, is_allowed_test_path,
     require_target_branch, validate_candidate,
 )
 from .models import CrashAlert, FileChange, FixPlan, ManualReview, PublishedFix
@@ -40,6 +39,7 @@ def _review(reason: Any) -> ManualReview:
 def existing_fix(
     github: Any, *, alert: CrashAlert, issue_number: int,
     base_branch: str, bot_login: str, release_sha: str, branch_base_sha: str,
+    publication_store: Any,
 ) -> PublishedFix | ManualReview | None:
     """Reuse a prior publication only for the exact investigated release and origin."""
     if not _is_issue_number(issue_number):
@@ -62,13 +62,12 @@ def existing_fix(
         head_sha = find_branch_head(github, branch_name_for(identity_hash, target, issue_number))
     if head_sha is None:
         return None
-    raw = read_repository_file(github, head_sha, manifest_path_for(identity_hash))
     try:
-        manifest = json.loads(raw) if raw is not None else None
-    except ValueError:
-        manifest = None
+        manifest = publication_store.get_publication(head_sha)
+    except (ValueError, TypeError):
+        return _review('기존 자동 수정 브랜치의 외부 검증 기록을 읽을 수 없습니다.')
     if not isinstance(manifest, dict):
-        return _review('기존 자동 수정 브랜치의 manifest를 읽을 수 없습니다.')
+        return _review('기존 자동 수정 브랜치의 외부 검증 기록을 찾을 수 없습니다.')
     source_sha = manifest.get('sourceSha')
     manifest_branch_base_sha = manifest.get('branchBaseSha')
     if manifest.get('version') != 3 or manifest.get('issueNumber') != issue_number \
@@ -80,13 +79,15 @@ def existing_fix(
         identity_hash=identity_hash, source_sha=source_sha, source_path=manifest['sourcePath'],
         branch_base_sha=branch_base_sha, title=_fix_title(alert, target),
         issue_number=issue_number, base_branch=target, bot_login=bot_login,
+        publication_store=publication_store,
     )
 
 
 def publish_investigated_fix(
     github: Any, *, alert: CrashAlert, evidence: Mapping[str, Any], decision: Any,
     issue_number: int, base_branch: str, base_sha: str, branch_base_sha: str,
-    release_sha: str, bot_login: str, verification: Any, prior_bot_logins: tuple[str, ...] = (),
+    release_sha: str, bot_login: str, verification: Any, publication_store: Any,
+    prior_bot_logins: tuple[str, ...] = (),
 ) -> PublishedFix | ManualReview:
     """Validate independently verified changes against exact pinned GitHub bytes."""
     if not _is_issue_number(issue_number):
@@ -167,7 +168,9 @@ def publish_investigated_fix(
         title=_fix_title(alert, target), issue_number=issue_number,
         base_branch=target, branch_base_sha=branch_base_sha,
     )
-    published = publish_fix_pull_request(github, plan=plan, bot_login=bot_login)
+    published = publish_fix_pull_request(
+        github, plan=plan, bot_login=bot_login, publication_store=publication_store,
+    )
     if not isinstance(published, (PublishedFix, ManualReview)):
         raise ValueError('Unexpected publication result')
     return published

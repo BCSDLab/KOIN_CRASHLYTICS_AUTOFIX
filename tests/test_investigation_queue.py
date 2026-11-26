@@ -452,3 +452,74 @@ def test_serial_state_writes_survive_stale_ref_reads_without_losing_updates():
     saved = InvestigationQueue(github).get(alert)
     assert saved['attempts'] == {'production': 1}
     assert saved['analyses']['production']['analysis'] == 'Completed investigation'
+
+
+def _publication_fixture():
+    from crashlytics_automation.candidate import candidate_manifest, identity_hash_for
+    job, decision = _proposal_fixture(None)
+    return candidate_manifest(
+        issue_id=service_context_alert().issue_id, issue_number=job['issueNumber'],
+        identity_hash=identity_hash_for(service_context_alert().issue_id, job['releaseSha']),
+        base_sha='d' * 40, branch_base_sha='b' * 40, source_sha=job['releaseSha'],
+        source_path=decision['sourcePath'],
+        files=[{key: item[key] for key in ('path', 'kind', 'beforeSha256', 'afterSha256')}
+               for item in decision['files']],
+    )
+
+
+def test_publication_record_survives_interleaved_job_writes_without_app_branch_files():
+    github = MemoryGitHub()
+    queue = InvestigationQueue(github)
+    job, _ = _proposal_fixture(queue)
+    queue.put(job)
+    manifest = _publication_fixture()
+    head = 'e' * 40
+    queue.put_publication(head, manifest)
+    job['attempts']['production'] = 1
+    queue.put(job)
+
+    fresh = InvestigationQueue(github)
+    assert fresh.get_publication(head) == manifest
+    assert fresh.get(service_context_alert())['attempts'] == {'production': 1}
+    assert set(github.refs) == {STATE_REFERENCE}
+    assert f'publications/{head}.json' in fresh._entries(fresh._head())
+
+
+def test_publication_record_cannot_be_rebound_to_different_verification():
+    github = MemoryGitHub()
+    queue = InvestigationQueue(github)
+    manifest = _publication_fixture()
+    head = 'e' * 40
+    queue.put_publication(head, manifest)
+    altered = {**manifest, 'baseSha': 'f' * 40}
+    with pytest.raises(JobConflict, match='different verification'):
+        queue.put_publication(head, altered)
+    assert InvestigationQueue(github).get_publication(head) == manifest
+
+
+@pytest.mark.parametrize('field,value', [('headSha', 'f' * 40), ('manifestDigest', 'f' * 64)])
+def test_external_publication_rejects_tampered_binding_and_digest(field, value):
+    import json
+    github = MemoryGitHub()
+    queue = InvestigationQueue(github)
+    head = 'e' * 40
+    queue.put_publication(head, _publication_fixture())
+    path = f'publications/{head}.json'
+    parent = github.refs[STATE_REFERENCE]
+    record_sha = queue._entries(parent)[path]
+    record = json.loads(github.blobs[record_sha])
+    record[field] = value
+    replacement = github.rest('POST', f'{REPOSITORY_PATH}/git/blobs', {
+        'content': base64.b64encode(json.dumps(record).encode()).decode(), 'encoding': 'base64',
+    })['sha']
+    tree = github.rest('POST', f'{REPOSITORY_PATH}/git/trees', {
+        'base_tree': github.commits[parent]['tree'],
+        'tree': [{'path': path, 'mode': '100644', 'type': 'blob', 'sha': replacement}],
+    })['sha']
+    commit = github.rest('POST', f'{REPOSITORY_PATH}/git/commits', {
+        'tree': tree, 'parents': [parent], 'message': 'Malformed external update',
+    })['sha']
+    github.rest('PATCH', f'{REPOSITORY_PATH}/git/refs/{STATE_REFERENCE.removeprefix("refs/")}',
+                {'sha': commit, 'force': False})
+    with pytest.raises(ValueError):
+        InvestigationQueue(github).get_publication(head)

@@ -1,4 +1,4 @@
-"""Durable investigation state in an automation-repository metadata ref, not app branches."""
+"""Durable investigation and publication metadata in a non-branch Git ref."""
 
 from __future__ import annotations
 
@@ -15,6 +15,8 @@ from .task_payloads import parse_alert_payload
 
 POLICY_VERSION = 2
 PROPOSAL_VERSION = 1
+PUBLICATION_VERSION = 1
+MAX_PUBLICATION_BYTES = 64 * 1024
 DEFAULT_ATTEMPT_LIMIT = 3
 APPROVED_ATTEMPT_LIMIT = DEFAULT_ATTEMPT_LIMIT + 1
 MAX_JOB_BYTES = 512 * 1024
@@ -167,7 +169,7 @@ class InvestigationQueue:
             for entry in result['tree']
             if isinstance(entry, dict) and entry.get('type') == 'blob'
             and isinstance(entry.get('path'), str)
-            and re.fullmatch(r'(?:(?:jobs|pending|active)/[0-9a-f]{64}\.json|proposals/[0-9a-f]{64}\.json)', entry['path'])
+            and re.fullmatch(r'(?:(?:jobs|pending|active|proposals)/[0-9a-f]{64}\.json|publications/[0-9a-f]{40}\.json)', entry['path'])
             and isinstance(entry.get('sha'), str) and _SHA.fullmatch(entry['sha'])
         }
 
@@ -364,6 +366,88 @@ class InvestigationQueue:
             raise ValueError('Proposal must include a source change and regression test')
         return envelope
 
+    def _read_publication(self, head_sha: str, blob_sha: str) -> dict[str, Any]:
+        from .candidate import manifest_digest, validate_manifest
+        blob = self.github.rest('GET', f'{REPOSITORY_PATH}/git/blobs/{blob_sha}')
+        encoded = blob.get('content') if isinstance(blob, dict) and blob.get('encoding') == 'base64' else None
+        if not isinstance(encoded, str) or len(encoded) > MAX_PUBLICATION_BYTES * 2:
+            raise ValueError('Invalid publication record blob')
+        raw = base64.b64decode(encoded.replace('\n', ''), validate=True)
+        if len(raw) > MAX_PUBLICATION_BYTES:
+            raise ValueError('Publication record is too large')
+        record = json.loads(raw.decode('utf-8'))
+        if not isinstance(record, dict) or set(record) != {'version', 'headSha', 'manifest', 'manifestDigest'}:
+            raise ValueError('Malformed publication record')
+        if type(record['version']) is not int or record['version'] != PUBLICATION_VERSION or record['headSha'] != head_sha:
+            raise ValueError('Publication record is bound to a different head')
+        manifest = record['manifest']
+        if not validate_manifest(manifest)['valid'] or record['manifestDigest'] != manifest_digest(manifest):
+            raise ValueError('Publication record content or digest is invalid')
+        return manifest
+
+    def get_publication(self, head_sha: str) -> dict[str, Any] | None:
+        if not isinstance(head_sha, str) or _SHA.fullmatch(head_sha) is None:
+            raise ValueError('Invalid publication head')
+        blob = self._entries(self._written_head or self._head()).get(f'publications/{head_sha}.json')
+        return self._read_publication(head_sha, blob) if blob is not None else None
+
+    def put_publication(self, head_sha: str, manifest: dict[str, Any]) -> None:
+        from .candidate import canonical_json, manifest_digest, validate_manifest
+        if not isinstance(head_sha, str) or _SHA.fullmatch(head_sha) is None or not validate_manifest(manifest)['valid']:
+            raise ValueError('Invalid publication identity or manifest')
+        raw = canonical_json({
+            'version': PUBLICATION_VERSION, 'headSha': head_sha, 'manifest': manifest,
+            'manifestDigest': manifest_digest(manifest),
+        }).encode('utf-8')
+        if len(raw) > MAX_PUBLICATION_BYTES:
+            raise ValueError('Publication record is too large')
+        blob = self.github.rest('POST', f'{REPOSITORY_PATH}/git/blobs', {
+            'content': base64.b64encode(raw).decode('ascii'), 'encoding': 'base64',
+        })
+        blob_sha = blob.get('sha') if isinstance(blob, dict) else None
+        if not isinstance(blob_sha, str) or _SHA.fullmatch(blob_sha) is None:
+            raise ValueError('Invalid publication blob SHA')
+        path = f'publications/{head_sha}.json'
+        for attempt in range(3):
+            head = self._written_head if attempt == 0 and self._written_head is not None else self._head()
+            existing = self._entries(head).get(path)
+            if existing is not None:
+                if self._read_publication(head_sha, existing) != manifest:
+                    raise JobConflict('Publication head already has a different verification record')
+                return
+            try:
+                self._written_head = self._advance_head(
+                    head, [{'path': path, 'mode': '100644', 'type': 'blob', 'sha': blob_sha}],
+                    f'Publication {head_sha[:12]}',
+                )
+                return
+            except Exception as error:
+                if getattr(error, 'status', None) in (409, 422):
+                    self._written_head = None
+                    continue
+                raise
+        raise JobConflict('Publication metadata reference changed concurrently')
+
+    def _advance_head(self, head: str | None, changes: list[dict[str, Any]], message: str) -> str:
+        tree_body: dict[str, Any] = {'tree': changes}
+        if head is not None:
+            parent = self.github.rest('GET', f'{REPOSITORY_PATH}/git/commits/{head}')
+            tree_body['base_tree'] = parent['tree']['sha']
+        tree = self.github.rest('POST', f'{REPOSITORY_PATH}/git/trees', tree_body)
+        commit = self.github.rest('POST', f'{REPOSITORY_PATH}/git/commits', {
+            'message': message, 'tree': tree['sha'], 'parents': [head] if head else [],
+        })
+        sha = commit.get('sha') if isinstance(commit, dict) else None
+        if not isinstance(sha, str) or _SHA.fullmatch(sha) is None:
+            raise ValueError('Invalid metadata commit SHA')
+        if head is None:
+            self.github.rest('POST', f'{REPOSITORY_PATH}/git/refs', {'ref': STATE_REFERENCE, 'sha': sha})
+        else:
+            self.github.rest('PATCH', f'{REPOSITORY_PATH}/git/refs/{STATE_REFERENCE.removeprefix("refs/")}', {
+                'sha': sha, 'force': False,
+            })
+        return sha
+
     def put(self, job: dict[str, Any]) -> None:
         validate_job(job)
         payload = {key: value for key, value in job.items() if key != '_blobSha'}
@@ -404,30 +488,16 @@ class InvestigationQueue:
                     'path': self._proposal_path(job, proposal_target), 'mode': '100644',
                     'type': 'blob', 'sha': proposal_sha,
                 })
-            tree_body: dict[str, Any] = {'tree': changed}
-            if head is not None:
-                parent = self.github.rest('GET', f'{REPOSITORY_PATH}/git/commits/{head}')
-                tree_body['base_tree'] = parent['tree']['sha']
-            tree = self.github.rest('POST', f'{REPOSITORY_PATH}/git/trees', tree_body)
-            commit = self.github.rest('POST', f'{REPOSITORY_PATH}/git/commits', {
-                'message': f'Investigation {job["id"][:12]}: {job["status"]}',
-                'tree': tree['sha'], 'parents': [head] if head else [],
-            })
             try:
-                if head is None:
-                    self.github.rest('POST', f'{REPOSITORY_PATH}/git/refs', {
-                        'ref': STATE_REFERENCE, 'sha': commit['sha'],
-                    })
-                else:
-                    self.github.rest('PATCH', f'{REPOSITORY_PATH}/git/refs/{STATE_REFERENCE.removeprefix("refs/")}', {
-                        'sha': commit['sha'], 'force': False,
-                    })
+                new_head = self._advance_head(
+                    head, changed, f'Investigation {job["id"][:12]}: {job["status"]}',
+                )
             except Exception as error:
                 if getattr(error, 'status', None) in (409, 422):
                     self._written_head = None
                     continue
                 raise
             job['_blobSha'] = blob_sha
-            self._written_head = commit['sha']
+            self._written_head = new_head
             return
         raise JobConflict('Investigation metadata reference changed concurrently')

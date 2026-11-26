@@ -11,13 +11,13 @@ from __future__ import annotations
 
 import base64
 import binascii
-import json
 import re
 from typing import Any
 from urllib.parse import quote
 
-from .candidate import MAX_FILE_BYTES, MAX_TOTAL_BYTES, branch_name_for, manifest_digest, manifest_path_for, sha256, validate_manifest
+from .candidate import MAX_FILE_BYTES, MAX_TOTAL_BYTES, branch_name_for, manifest_digest, sha256, validate_manifest
 from .github import OWNER, REPO, REPOSITORY_PATH
+from .investigation_jobs import InvestigationQueue
 from .pull_requests import CLOSURE_REFERENCE
 from .repository import TARGET_BRANCHES
 from .task_payloads import validate_merge_task
@@ -87,11 +87,10 @@ def _read_file(github: Any, path: str, revision: str) -> dict[str, Any]:
     return {'bytes': content, 'size': len(content)}
 
 
-def _verify_changes(github: Any, pr: dict[str, Any], manifest: dict[str, Any], path: str,
+def _verify_changes(github: Any, pr: dict[str, Any], manifest: dict[str, Any],
                     job: dict[str, Any]) -> dict[str, str] | None:
     files = _pages(github, f"{REPOSITORY_PATH}/pulls/{pr['number']}/files")
     expected = {file['path']: file for file in manifest['files']}
-    expected[path] = None
     if len(files) != len(expected):
         return _blocked('pull request changes do not match the manifest')
     by_name = {}
@@ -100,8 +99,6 @@ def _verify_changes(github: Any, pr: dict[str, Any], manifest: dict[str, Any], p
         if not isinstance(name, str) or name in by_name or name not in expected or file.get('status') not in ('added', 'modified'):
             return _blocked('pull request changes a file outside the manifest')
         by_name[name] = file
-    if by_name[path]['status'] != 'added' or not _read_file(github, path, job['baseSha']).get('missing'):
-        return _blocked('manifest must be newly added on the pull request')
     total_bytes = 0
     for entry in manifest['files']:
         head = _read_file(github, entry['path'], job['headSha'])
@@ -260,15 +257,18 @@ def attempt_merge(github: Any, job: dict[str, Any], *, bot_login: str) -> dict[s
     ref = github.rest('GET', f'{REPOSITORY_PATH}/git/ref/heads/{target}')
     if ref.get('object', {}).get('sha') != job['baseSha']:
         return _pending(f'{target} advanced after the merge was scheduled; a fresh candidate is required')
-    path = manifest_path_for(identity_hash)
-    file = _read_file(github, path, job['headSha'])
-    if file.get('missing') or file.get('invalid') or file['size'] > MAX_FILE_BYTES:
-        return _blocked('candidate manifest is missing, unsupported or too large')
     try:
-        manifest = json.loads(file['bytes'])
+        manifest = InvestigationQueue(github).get_publication(job['headSha'])
+    except (ValueError, TypeError):
+        return _blocked('candidate publication metadata is invalid or tampered')
+    if manifest is None:
+        return _blocked('candidate publication metadata is missing')
+    try:
         digest = manifest_digest(manifest)
-    except (ValueError, TypeError, UnicodeError):
-        return _blocked('candidate manifest is not valid JSON')
+    except (ValueError, TypeError):
+        return _blocked('candidate publication metadata is invalid')
+    if digest != job['manifestDigest']:
+        return _blocked('candidate publication digest does not match the scheduled job')
     is_current_branch = _is_current_issue_branch(pr, target, job['issueNumber'])
     if is_current_branch != (manifest.get('version') == 3):
         return _blocked('pull request branch and manifest versions do not match')
@@ -290,7 +290,7 @@ def attempt_merge(github: Any, job: dict[str, Any], *, bot_login: str) -> dict[s
     ):
         return _blocked('candidate commit does not originate from its pinned branch base')
     for problem in (
-        lambda: _verify_changes(github, pr, manifest, path, job),
+        lambda: _verify_changes(github, pr, manifest, job),
         lambda: _verify_checks(github, job['headSha']),
     ):
         result = problem()

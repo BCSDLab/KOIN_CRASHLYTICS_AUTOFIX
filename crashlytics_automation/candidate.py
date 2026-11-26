@@ -94,10 +94,6 @@ def branch_name_for(identity_hash: Any, base_branch: Any, issue_number: Any) -> 
     return f'fix/{issue_number}-crashlytics-{target}-{identity_hash}'
 
 
-def manifest_path_for(identity_hash: Any) -> str:
-    return f'automation/crashlytics/runs/{_require_identity_hash(identity_hash)}.json'
-
-
 def regression_test_name(identity_hash: Any) -> str:
     return f'CrashlyticsRegression{_require_identity_hash(identity_hash)[:12]}Test.kt'
 
@@ -312,17 +308,8 @@ def manifest_digest(manifest: Any) -> str:
     return sha256(canonical_json(manifest))
 
 
-def manifest_bytes(manifest: Any) -> str:
-    """Canonical on-branch encoding.
-
-    The digest is defined over compact JSON.stringify(manifest), so the merge
-    gate can recompute it by parsing these bytes and stringifying the object again.
-    """
-    return f'{json.dumps(manifest, ensure_ascii=False, indent=2, allow_nan=False)}\n'
-
-
 def validate_manifest(manifest: Any, expected: Mapping[str, Any] | None = None) -> dict[str, Any]:
-    """Revalidate a parsed manifest (committed on a branch or read by the merge gate).
+    """Revalidate pinned publication metadata before branch reuse or merging.
 
     ``expected`` may pin issueId, identityHash, baseSha, sourceSha,
     sourcePath. Byte sizes and on-branch content can only be checked by the caller.

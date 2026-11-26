@@ -2,24 +2,20 @@
 
 The AI proof requires the blame commit to be a squash merge commit or the
 second parent of a merge commit from a configured-bot crashlytics fix PR.
-Branches count at either naming generation: the current
-``hotfix/<target>/crashlytics-<hash>`` (whose base branch must be that target)
-and the historical ``fix/crashlytics-<hash>``. The manifest at the blamed
-revision must validate and list the crashed file. The human
+The associated PR must belong to a configured bot and a recognized crash fix
+branch. Its immutable, head-bound publication record lives in the metadata ref
+and must validate and list the crashed source file. The human
 fallback never assigns a bot, bot-like, or organization account. API and schema
 failures raise; "no AI origin" is only reported after a complete lookup.
 """
 
 from __future__ import annotations
 
-import base64
-import binascii
-import json
 import re
 from typing import Any, Mapping
 from urllib.parse import quote
 
-from .candidate import manifest_path_for, validate_manifest
+from .candidate import validate_manifest
 from .models import MergedAiFix, SourceLocation
 from .repository import OWNER, REPO, REPOSITORY_PATH, TARGET_BRANCHES
 
@@ -34,6 +30,7 @@ query OriginPulls($owner: String!, $name: String!, $oid: GitObjectID!) {
             number
             merged
             headRefName
+            headRefOid
             baseRefName
             author { __typename login }
             mergeCommit {
@@ -78,11 +75,11 @@ def find_ai_fix_for_line(
 
     A pull request counts only when the blamed commit is its merge commit
     (historical squash) or its merged head (second parent), its head branch is
-    ``hotfix/<target>/crashlytics-<identityHash>`` targeting that same base
-    branch or the historical ``fix/crashlytics-<identityHash>``, its author is a
-    current or explicitly trusted former bot, and the manifest committed at that
-    exact revision validates for that identity and lists the crashed file as a
-    modified source file. Anything else — unmerged PRs, other bots, human PRs,
+    ``fix/<issue>-crashlytics-<target>-<identityHash>`` or a recognized historical
+    branch, its author is a
+    current or explicitly trusted former bot, and its head-bound external
+    publication record validates for that identity and lists the crashed file
+    as a modified source file. Anything else — unmerged PRs, other bots, human PRs,
     unrelated files or revisions — is not proof.
     """
     if not isinstance(bot_logins, tuple) or not bot_logins:
@@ -101,8 +98,11 @@ def find_ai_fix_for_line(
         identity_hash = _fix_branch_identity(head, base)
         if identity_hash is None or not _merge_commit_matches(pull.get("mergeCommit"), source.change_sha):
             continue
+        publication_head = pull.get("headRefOid")
+        if not isinstance(publication_head, str) or re.fullmatch(r"[0-9a-f]{40}", publication_head) is None:
+            raise RuntimeError("GitHub origin publication head is invalid")
         if not _manifest_lists_crashed_file(
-            github, source.change_sha, identity_hash, source.path, head,
+            github, publication_head, identity_hash, source.path, head,
         ):
             continue
         return MergedAiFix(pull_number=number, commit_sha=source.change_sha)
@@ -166,8 +166,9 @@ def _manifest_lists_crashed_file(
     source_path: str,
     head_ref: str,
 ) -> bool:
-    """Validate the manifest committed at the blamed AI revision."""
-    manifest = _manifest_at(github, revision, identity_hash)
+    """Validate the external verification record for the merged PR head."""
+    from .investigation_jobs import InvestigationQueue
+    manifest = InvestigationQueue(github).get_publication(revision)
     if manifest is None or not validate_manifest(manifest, {"identityHash": identity_hash})["valid"]:
         return False
     current = _ISSUE_FIX_BRANCH.fullmatch(head_ref)
@@ -346,44 +347,6 @@ def _assignee_page(github: Any, page: int) -> list[Mapping[str, Any]]:
 
 
 # --- GitHub reads ---------------------------------------------------------
-
-
-def _read_text(github: Any, revision: str, path: str) -> str | None:
-    """Read one file blob at an exact revision; a missing file is not a failure."""
-    try:
-        result = github.rest(
-            "GET",
-            f"{REPOSITORY_PATH}/contents/{quote(path, safe='/')}?ref={quote(revision, safe='')}",
-        )
-    except Exception as error:  # noqa: BLE001 - 404 means the file does not exist
-        if getattr(error, "status", None) == 404:
-            return None
-        raise
-    if (
-        not _is_mapping(result)
-        or result.get("type") != "file"
-        or result.get("encoding") != "base64"
-        or not isinstance(result.get("content"), str)
-    ):
-        raise RuntimeError("GitHub content lookup failed")
-    try:
-        return base64.b64decode("".join(result["content"].split()), validate=True).decode("utf-8")
-    except (ValueError, binascii.Error, UnicodeDecodeError) as error:
-        raise RuntimeError("GitHub content lookup failed") from error
-
-
-def _manifest_at(github: Any, revision: str, identity_hash: str) -> Mapping[str, Any] | None:
-    """Read the pinned manifest. A malformed artifact is an error, not a non-match."""
-    text = _read_text(github, revision, manifest_path_for(identity_hash))
-    if text is None:
-        return None
-    try:
-        manifest = json.loads(text)
-    except ValueError as error:
-        raise RuntimeError("GitHub origin manifest failed") from error
-    if not _is_mapping(manifest):
-        raise RuntimeError("GitHub origin manifest failed")
-    return manifest
 
 
 def _is_mapping(value: object) -> bool:

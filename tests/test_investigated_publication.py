@@ -1,5 +1,4 @@
 import hashlib
-import json
 
 from crashlytics_automation import fix_generation
 from crashlytics_automation.candidate import (
@@ -8,13 +7,30 @@ from crashlytics_automation.candidate import (
     identity_hash_for,
     is_allowed_source_path,
     is_allowed_test_path,
-    manifest_path_for,
     regression_test_name,
     validate_manifest,
 )
 from crashlytics_automation.models import CrashAlert, FileChange, FixPlan, ManualReview, SourceLocation
-from crashlytics_automation.pull_requests import publish_fix_pull_request
+from crashlytics_automation.pull_requests import publish_fix_pull_request, resume_fix_pull_request
 from crashlytics_automation.repository import REPOSITORY
+
+class PublicationStore:
+    def __init__(self, record=None, *, fail=False):
+        self.records = {}
+        self.record = record
+        self.fail = fail
+        self.events = []
+
+    def put_publication(self, head_sha, manifest):
+        self.events.append(('put', head_sha))
+        if self.fail:
+            raise ValueError('metadata unavailable')
+        self.records[head_sha] = manifest
+
+    def get_publication(self, head_sha):
+        self.events.append(('get', head_sha))
+        return self.records.get(head_sha, self.record)
+
 
 ALERT = CrashAlert('crash-1', '1.2.3', 'event-1', '2026-01-01', 'Crash', 'detail')
 BASE_SHA = 'a' * 40
@@ -78,6 +94,7 @@ def test_unverified_investigation_never_publishes(monkeypatch):
         issue_number=1, base_branch='production', base_sha=BASE_SHA,
         branch_base_sha=BRANCH_BASE_SHA, release_sha=RELEASE_SHA,
         bot_login='autofix[bot]', verification={'passed': False},
+        publication_store=PublicationStore(),
     )
 
     assert isinstance(result, ManualReview)
@@ -99,6 +116,7 @@ def test_unknown_baseline_never_publishes(monkeypatch):
         issue_number=1, base_branch='production', base_sha=BASE_SHA,
         branch_base_sha=BRANCH_BASE_SHA, release_sha=RELEASE_SHA,
         bot_login='autofix[bot]', verification={'passed': True},
+        publication_store=PublicationStore(),
     )
 
     assert isinstance(result, ManualReview)
@@ -122,9 +140,10 @@ def test_java_instrumentation_test_publishes_release_scoped_manifest(monkeypatch
     expected = PublishedFix(12, 'e' * 40, BASE_SHA, 'f' * 64, 'production')
     captured = {}
 
-    def publish(_github, *, plan, bot_login):
+    def publish(_github, *, plan, bot_login, publication_store):
         captured['plan'] = plan
         captured['bot_login'] = bot_login
+        captured['publication_store'] = publication_store
         return expected
 
     monkeypatch.setattr(fix_generation, 'publish_fix_pull_request', publish)
@@ -133,6 +152,7 @@ def test_java_instrumentation_test_publishes_release_scoped_manifest(monkeypatch
         issue_number=1, base_branch='production', base_sha=BASE_SHA,
         branch_base_sha=BRANCH_BASE_SHA, release_sha=RELEASE_SHA,
         bot_login='autofix[bot]', verification={'passed': True},
+        publication_store=PublicationStore(),
     )
 
     plan = captured['plan']
@@ -166,6 +186,7 @@ def test_changed_or_existing_test_baseline_is_rejected(monkeypatch):
         issue_number=1, base_branch='production', base_sha=BASE_SHA,
         branch_base_sha=BRANCH_BASE_SHA, release_sha=RELEASE_SHA,
         bot_login='autofix[bot]', verification={'passed': True},
+        publication_store=PublicationStore(),
     )
 
     assert isinstance(result, ManualReview)
@@ -177,7 +198,6 @@ def test_source_release_changes_branch_test_and_manifest_identity():
     second = identity_hash_for(ALERT.issue_id, OTHER_RELEASE_SHA)
     assert first != second
     assert branch_name_for(first, 'production', 1) != branch_name_for(second, 'production', 1)
-    assert manifest_path_for(first) != manifest_path_for(second)
     assert regression_test_name(first) != regression_test_name(second)
     assert not is_allowed_test_path(
         f'domain/src/test/java/org/koin/{regression_test_name(first)}', second,
@@ -218,7 +238,7 @@ def test_existing_fix_does_not_reuse_prior_release_issue_only_branch(monkeypatch
     result = fix_generation.existing_fix(
         object(), alert=ALERT, issue_number=1, base_branch='production',
         bot_login='autofix[bot]', release_sha=OTHER_RELEASE_SHA,
-        branch_base_sha=BRANCH_BASE_SHA,
+        branch_base_sha=BRANCH_BASE_SHA, publication_store=PublicationStore(),
     )
 
     assert result is None
@@ -297,19 +317,91 @@ def test_develop_publication_commits_production_tree_but_targets_develop():
         base_branch='develop',
         branch_base_sha=BRANCH_BASE_SHA,
     )
-    result = publish_fix_pull_request(Github(), plan=plan, bot_login='autofix[bot]')
+    store = PublicationStore()
+    result = publish_fix_pull_request(
+        Github(), plan=plan, bot_login='autofix[bot]', publication_store=store,
+    )
 
     assert result.base_sha == DEVELOP_SHA
     assert result.base_branch == 'develop'
     tree_call = next(call for call in calls if call[1].endswith('/git/trees'))
     assert tree_call[2]['base_tree'] == '1' * 40
+    assert {entry['path'] for entry in tree_call[2]['tree']} == {SOURCE_PATH, TEST_PATH}
     commit_call = next(call for call in calls if call[1].endswith('/git/commits'))
     assert commit_call[2]['parents'] == [BRANCH_BASE_SHA]
+    assert f'Crashlytics-Verification: {result.manifest_digest}' in commit_call[2]['message']
     ref_call = next(call for call in calls if call[1].endswith('/git/refs'))
     assert ref_call[2]['ref'] == f'refs/heads/fix/17-crashlytics-develop-{IDENTITY_HASH}'
     pull_call = next(call for call in calls if call[1].endswith('/pulls'))
     assert pull_call[2]['base'] == 'develop'
     assert pull_call[2]['head'] == f'fix/17-crashlytics-develop-{IDENTITY_HASH}'
+    assert 'manifest' not in pull_call[2]['body'].lower()
+    assert store.events[0] == ('put', result.head_sha)
+
+
+def test_metadata_persistence_failure_blocks_branch_and_pull_request():
+    manifest = candidate_manifest(
+        issue_id=ALERT.issue_id, identity_hash=IDENTITY_HASH, issue_number=17,
+        base_sha=DEVELOP_SHA, branch_base_sha=BRANCH_BASE_SHA,
+        source_sha=RELEASE_SHA, source_path=SOURCE_PATH,
+        files=[
+            {'path': SOURCE_PATH, 'kind': 'source',
+             'beforeSha256': hashlib.sha256(SOURCE_BASE.encode()).hexdigest(),
+             'afterSha256': hashlib.sha256(SOURCE_AFTER.encode()).hexdigest()},
+            {'path': TEST_PATH, 'kind': 'test', 'beforeSha256': None,
+             'afterSha256': hashlib.sha256(TEST_CONTENT.encode()).hexdigest()},
+        ],
+    )
+    calls = []
+
+    class Github:
+        def rest(self, method, path, data=None):
+            calls.append((method, path, data))
+            if method == 'GET' and path.endswith(f'/git/commits/{BRANCH_BASE_SHA}'):
+                return {'tree': {'sha': '1' * 40}}
+            if method == 'POST' and path.endswith('/git/blobs'):
+                return {'sha': '2' * 40}
+            if method == 'POST' and path.endswith('/git/trees'):
+                return {'sha': '3' * 40}
+            if method == 'POST' and path.endswith('/git/commits'):
+                return {'sha': '4' * 40}
+            raise AssertionError((method, path, data))
+
+    plan = FixPlan(
+        manifest=manifest,
+        changes=(FileChange(SOURCE_PATH, SOURCE_AFTER), FileChange(TEST_PATH, TEST_CONTENT)),
+        title='fix', issue_number=17, base_branch='develop',
+        branch_base_sha=BRANCH_BASE_SHA,
+    )
+    result = publish_fix_pull_request(
+        Github(), plan=plan, bot_login='autofix[bot]',
+        publication_store=PublicationStore(fail=True),
+    )
+
+    assert isinstance(result, ManualReview)
+    assert any(path.endswith('/git/commits') for _method, path, _data in calls)
+    assert not any(path.endswith('/git/refs') or path.endswith('/pulls')
+                   for _method, path, _data in calls)
+
+
+def test_resume_refuses_missing_or_tampered_external_publication_record():
+    class NoRequests:
+        def rest(self, *_args, **_kwargs):
+            raise AssertionError('an invalid external record must fail before GitHub lookups')
+
+    class TamperedStore:
+        def get_publication(self, _head_sha):
+            raise ValueError('tampered publication record')
+
+    for store in (PublicationStore(), TamperedStore()):
+        result = resume_fix_pull_request(
+            NoRequests(), head_sha='e' * 40, issue_id=ALERT.issue_id,
+            identity_hash=IDENTITY_HASH, source_sha=RELEASE_SHA,
+            source_path=SOURCE_PATH, branch_base_sha=BRANCH_BASE_SHA,
+            title='fix', issue_number=1, base_branch='production',
+            bot_login='autofix[bot]', publication_store=store,
+        )
+        assert isinstance(result, ManualReview)
 
 
 def test_existing_fix_rejects_a_persisted_origin_mismatch(monkeypatch):
@@ -323,7 +415,7 @@ def test_existing_fix_rejects_a_persisted_origin_mismatch(monkeypatch):
     }
     monkeypatch.setattr(fix_generation, 'find_target_pull_request', lambda *_a: None)
     monkeypatch.setattr(fix_generation, 'find_branch_head', lambda *_a: 'e' * 40)
-    monkeypatch.setattr(fix_generation, 'read_repository_file', lambda *_a: json.dumps(manifest))
+    store = PublicationStore(record=manifest)
     monkeypatch.setattr(
         fix_generation, 'resume_fix_pull_request', lambda *_a, **_k: resumed.append(True),
     )
@@ -331,7 +423,7 @@ def test_existing_fix_rejects_a_persisted_origin_mismatch(monkeypatch):
     result = fix_generation.existing_fix(
         object(), alert=ALERT, issue_number=1, base_branch='develop',
         bot_login='autofix[bot]', release_sha=RELEASE_SHA,
-        branch_base_sha=BRANCH_BASE_SHA,
+        branch_base_sha=BRANCH_BASE_SHA, publication_store=store,
     )
 
     assert isinstance(result, ManualReview)
