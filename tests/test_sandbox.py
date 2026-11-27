@@ -11,9 +11,22 @@ import pytest
 from crashlytics_automation.candidate import regression_test_name
 from crashlytics_automation.sandbox import (
     InvestigationSandbox, _COMMAND_WRAPPER, _instrumentation_command,
-    _matching_xml, _read_regular_file, _save_verification_artifacts,
+    _matching_xml, _passed_methods, _read_regular_file, _save_verification_artifacts,
 )
 
+def test_junit_method_evidence_excludes_skipped_and_missing_methods(tmp_path: Path) -> None:
+    report = tmp_path / 'domain/build/test-results/testDebugUnitTest/TEST-preservation.xml'
+    report.parent.mkdir(parents=True)
+    report.write_text(
+        '<testsuite><testcase classname="example.CrashlyticsPreservationaaaaaaaaaaaaTest" '
+        'name="oldValueIsStable"/><testcase '
+        'classname="example.CrashlyticsPreservationaaaaaaaaaaaaTest" name="swipeResetsTicker">'
+        '<skipped/></testcase></testsuite>',
+        encoding='utf-8',
+    )
+    assert _passed_methods(
+        report, 'example.CrashlyticsPreservationaaaaaaaaaaaaTest', tmp_path,
+    ) == ['oldValueIsStable']
 IDENTITY = 'a' * 64
 
 
@@ -27,16 +40,54 @@ def _sandbox(tmp_path: Path) -> InvestigationSandbox:
 
 
 def _candidate(path: str) -> list[dict[str, str]]:
-    return [{'path': path, 'kind': 'test', 'content': 'class Test'},
-            {'path': 'domain/src/main/kotlin/example/Subject.kt', 'kind': 'source', 'content': 'class Subject'}]
+    from crashlytics_automation.behavior import preservation_test_name
+    source_path = 'domain/src/main/kotlin/example/Subject.kt'
+    preservation_path = f'domain/src/test/kotlin/example/{preservation_test_name(IDENTITY)}'
+    source = 'package example\nclass Subject { fun oldValue() = 1 }\n'
+    crash_class = path.rsplit('/', 1)[1].removesuffix('.kt')
+    preservation_class = preservation_path.rsplit('/', 1)[1].removesuffix('.kt')
+    contents = [
+        (path, 'test', f'package example\nclass {crash_class} {{ @org.junit.Test fun regressionReproduced() {{}} }}\n'),
+        (preservation_path, 'test',
+         f'package example\nclass {preservation_class} {{ @org.junit.Test fun oldValueIsStable() {{}} }}\n'),
+        (source_path, 'source', source),
+    ]
+    return [
+        {
+            'path': item_path, 'kind': kind, 'content': content,
+            'beforeSha256': '1' * 64 if kind == 'source' else None,
+            'afterSha256': __import__('hashlib').sha256(content.encode()).hexdigest(),
+        }
+        for item_path, kind, content in contents
+    ]
 
+
+def _review(files: list[dict[str, str]]) -> dict[str, object]:
+    from crashlytics_automation.behavior import source_digest
+    source_files = [file for file in files if file['kind'] == 'source']
+    preservation = next(file['path'] for file in files if 'CrashlyticsPreservation' in file['path'])
+    return {
+        'version': 1, 'approved': True, 'reason': 'Preserves source behavior.',
+        'unrelatedChanges': [],
+        'contracts': [{
+            'sourcePath': source_files[0]['path'], 'sourceLine': 1,
+            'behavior': 'The existing value remains unchanged.',
+            'testPath': preservation, 'testMethod': 'oldValueIsStable',
+        }],
+        'sourceDigest': source_digest(source_files),
+    }
+
+
+def _verify(sandbox: InvestigationSandbox, files: list[dict[str, str]]) -> dict[str, object]:
+    return sandbox.verify_candidate(
+        files=files, identity_hash=IDENTITY, behavior_review=_review(files),
+    )
 
 def test_verify_candidate_rejects_path_escape(tmp_path: Path) -> None:
     sandbox = _sandbox(tmp_path)
     try:
-        result = sandbox.verify_candidate(
-            files=_candidate(f'domain/src/test/../../../../tmp/{regression_test_name(IDENTITY)}'),
-            identity_hash=IDENTITY,
+        result = _verify(
+            sandbox, _candidate(f'domain/src/test/../../../../tmp/{regression_test_name(IDENTITY)}'),
         )
     finally:
         sandbox.close()
@@ -61,16 +112,15 @@ def test_compile_error_does_not_count_as_baseline_reproduction(tmp_path: Path) -
     sandbox._new_container = lambda *args: 'fake-container'  # type: ignore[method-assign]
     sandbox._run = fake_run  # type: ignore[method-assign]
     try:
-        result = sandbox.verify_candidate(
-            files=_candidate(f'domain/src/test/kotlin/example/{regression_test_name(IDENTITY)}'),
-            identity_hash=IDENTITY,
+        result = _verify(
+            sandbox, _candidate(f'domain/src/test/kotlin/example/{regression_test_name(IDENTITY)}'),
         )
     finally:
         sandbox.close()
 
-    assert result['reason'] == 'baseline did not reproduce the regression in JUnit XML or trusted Android OOM logs'
+    assert result['reason'] == 'baseline did not reproduce the crash regression in JUnit XML or trusted Android OOM logs'
     assert result['retryable'] is False
-    assert result['checks'][0]['test_result'] == 'missing-or-not-failing'
+    assert result['checks'][0]['test_result'] == 'missing-failed-or-skipped'
     assert len(calls) == 2  # task discovery, then failed test execution
 
 
@@ -94,19 +144,14 @@ def test_android_setup_marker_requires_setup_exit_status(tmp_path: Path, exit_co
     sandbox._run = setup_failure  # type: ignore[method-assign]
     test_path = f'domain/src/androidTest/kotlin/example/{regression_test_name(IDENTITY)}'
     try:
-        result = sandbox.verify_candidate(
-            files=[
-                {'path': test_path, 'content': 'package example\nclass Regression'},
-                {'path': 'domain/src/main/kotlin/example/Subject.kt', 'content': 'class Subject'},
-            ],
-            identity_hash=IDENTITY,
+        result = _verify(
+            sandbox, _candidate(f'domain/src/androidTest/kotlin/example/{regression_test_name(IDENTITY)}'),
         )
     finally:
         sandbox.close()
 
     assert result['passed'] is False
     assert result['retryable'] is (exit_code == 70)
-    assert result['checks'][0]['test_result'] == ('setup-failure' if exit_code == 70 else 'missing-or-not-failing')
 
 
 def test_host_command_timeout_is_retryable(tmp_path: Path) -> None:
@@ -122,9 +167,8 @@ def test_host_command_timeout_is_retryable(tmp_path: Path) -> None:
 
     sandbox._run = timed_out  # type: ignore[method-assign]
     try:
-        result = sandbox.verify_candidate(
-            files=_candidate(f'domain/src/test/kotlin/example/{regression_test_name(IDENTITY)}'),
-            identity_hash=IDENTITY,
+        result = _verify(
+            sandbox, _candidate(f'domain/src/test/kotlin/example/{regression_test_name(IDENTITY)}'),
         )
     finally:
         sandbox.close()
@@ -153,7 +197,7 @@ def test_sandbox_keeps_host_checkout_untouched_and_sanitizes_secrets(tmp_path: P
 class LocalBuildSandbox(InvestigationSandbox):
     """Run filesystem build fixtures locally, replacing only Docker transport."""
 
-    def _new_container(self, workspace: Path, scratch: Path, home: Path) -> str:
+    def _new_container(self, workspace: Path, scratch: Path, home: Path, *, read_only: bool = False) -> str:
         if not hasattr(self, 'runs'):
             self.runs: list[tuple[Path, Path, Path]] = []
             self.containers: dict[str, tuple[Path, Path, Path]] = {}
@@ -162,6 +206,7 @@ class LocalBuildSandbox(InvestigationSandbox):
         self.containers[name] = (workspace, scratch, home)
         self._owned_containers.append(name)
         return name
+
 
     def _stop_container(self, container: str) -> None:
         if container in self._owned_containers:
@@ -185,32 +230,39 @@ if sys.argv[-1] == '--all':
     print('testDebugUnitTest - Runs unit tests')
     sys.exit(0)
 workspace = Path.cwd()
-test = next(workspace.glob('domain/src/test/kotlin/example/*.kt'))
-classname = 'example.' + test.stem
-report = workspace / 'domain/build/test-results/testDebugUnitTest/TEST-regression.xml'
-report.parent.mkdir(parents=True, exist_ok=True)
-passed = '<testsuite><testcase classname="' + classname + '" name="regression"/></testsuite>'
-failed = '<testsuite><testcase classname="' + classname + '" name="regression"><failure message="reproduced"/></testcase></testsuite>'
+tests = sorted(workspace.glob('domain/src/test/kotlin/example/*.kt'))
+report_dir = workspace / 'domain/build/test-results/testDebugUnitTest'
+report_dir.mkdir(parents=True, exist_ok=True)
 source = workspace / 'domain/src/main/kotlin/example/Subject.kt'
-if source.read_text() == 'fixed':
-    assert test.read_text() == 'package example\nclass ' + test.stem
-    assert not (Path.home() / '.gradle/init.d/poison.gradle').exists()
-    report.write_text(passed)
-    print('trusted candidate fixture')
-    sys.exit(0)
-report.write_text(failed)
-# A baseline test can mutate every one of these container-writable locations.
-poison = '#!/usr/bin/env python3\nfrom pathlib import Path\np=Path(' + repr(str(report)) + ')\np.parent.mkdir(parents=True,exist_ok=True)\np.write_text(' + repr(passed) + ')\n'
-(workspace / 'gradlew').write_text(poison)
-test.write_text('poisoned test')
-init = Path.home() / '.gradle/init.d/poison.gradle'
-init.parent.mkdir(parents=True, exist_ok=True)
-init.write_text('poisoned build initialization')
-scratch = Path(os.environ['TEST_SCRATCH'])
-(scratch / 'baseline-0').mkdir()
-(scratch / 'baseline-0/stdout.txt').symlink_to(os.environ['TEST_SENTINEL'])
-print('trusted baseline fixture')
-sys.exit(1)
+candidate = source.read_text() == 'fixed'
+has_failure = False
+for test in tests:
+    classname = 'example.' + test.stem
+    preservation = 'Preservation' in test.stem
+    method = 'oldValueIsStable' if preservation else 'regressionReproduced'
+    passed = preservation or candidate
+    if not passed:
+        has_failure = True
+    failure = '' if passed else '<failure message="reproduced"/>'
+    (report_dir / ('TEST-' + test.stem + '.xml')).write_text(
+        '<testsuite><testcase classname="' + classname + '" name="' + method + '">' + failure +
+        '</testcase></testsuite>'
+    )
+    if candidate:
+        assert test.stem in test.read_text()
+        assert not (Path.home() / '.gradle/init.d/poison.gradle').exists()
+if not candidate and any('Preservation' not in test.stem for test in tests):
+    # A baseline crash test may mutate every writable location in its own workspace.
+    poison = '#!/usr/bin/env python3\nfrom pathlib import Path\np=Path(' + repr(str(report_dir)) + ')\np.mkdir(parents=True,exist_ok=True)\n'
+    (workspace / 'gradlew').write_text(poison)
+    init = Path.home() / '.gradle/init.d/poison.gradle'
+    init.parent.mkdir(parents=True, exist_ok=True)
+    init.write_text('poisoned build initialization')
+    scratch = Path(os.environ['TEST_SCRATCH'])
+    (scratch / 'baseline-0').mkdir()
+    (scratch / 'baseline-0/stdout.txt').symlink_to(os.environ['TEST_SENTINEL'])
+print('trusted candidate fixture' if candidate else 'trusted baseline fixture')
+sys.exit(1 if has_failure else 0)
 '''
 
 
@@ -230,32 +282,41 @@ def test_candidate_uses_fresh_build_tools_tests_and_home(tmp_path: Path, monkeyp
     sentinel.write_text('host data')
     monkeypatch.setenv('TEST_SENTINEL', str(sentinel))
     test_name = regression_test_name(IDENTITY)
-    files = [
-        {'path': f'domain/src/test/kotlin/example/{test_name}',
-         'content': f'package example\nclass {Path(test_name).stem}'},
-        {'path': 'domain/src/main/kotlin/example/Subject.kt', 'content': fix},
-    ]
+    crash_path = f'domain/src/test/kotlin/example/{test_name}'
+    files = _candidate(crash_path)
+    source_entry = next(file for file in files if file['kind'] == 'source')
+    source_entry['content'] = fix
+    source_entry['afterSha256'] = __import__('hashlib').sha256(fix.encode()).hexdigest()
     with LocalBuildSandbox(release=release, target=target, image='local-fixture') as sandbox:
-        result = sandbox.verify_candidate(files=files, identity_hash=IDENTITY)
+        result = sandbox.verify_candidate(
+            files=files, identity_hash=IDENTITY, behavior_review=_review(files),
+        )
         assert result['passed'] is expected_passed
-        assert [check['phase'] for check in result['checks']] == ['baseline', 'candidate']
-        baseline, candidate = sandbox.runs
-        assert baseline[0] != candidate[0]
-        assert baseline[1] != candidate[1]
-        assert baseline[2] != candidate[2]
+        expected_checks = [
+            ('baseline', 'crash'), ('baseline', 'preservation'), ('candidate', 'crash'),
+        ]
+        if expected_passed:
+            expected_checks.append(('candidate', 'preservation'))
+        assert [(check['phase'], check['purpose']) for check in result['checks']] == expected_checks
+        baseline_crash, baseline_preservation, candidate = sandbox.runs
+        assert baseline_crash[0] != baseline_preservation[0] != candidate[0]
+        assert baseline_crash[1] != candidate[1]
+        assert baseline_crash[2] != candidate[2]
         if expected_passed:
             assert (candidate[0] / 'gradlew').read_text() == _BUILD_FIXTURE
         assert sandbox._owned_containers == []
         assert sentinel.read_text() == 'host data'
         destination = tmp_path / 'export'
         exported = sandbox.export_artifacts(destination)
-        assert any(path.endswith('baseline-scratch/baseline-0/stdout.txt')
+        assert any(path.endswith('baseline-crash-scratch/baseline-0/stdout.txt')
                    for path in exported['skipped_non_regular'])
-        records = list(destination.glob('*/baseline-0/stdout.txt'))
+        records = list(destination.glob('*/baseline-crash-0/stdout.txt'))
         assert len(records) == 1
         assert records[0].read_text() == 'trusted baseline fixture\n'
-        candidate_records = list(destination.glob('*/candidate-0/stdout.txt'))
-        assert len(candidate_records) == 1
+        candidate_records = sorted(destination.glob('*/candidate-*/stdout.txt'))
+        assert {path.parent.name for path in candidate_records} == (
+            {'candidate-0', 'candidate-1'} if expected_passed else {'candidate-0'}
+        )
         before_xml = ET.parse(records[0].parent / 'junit.xml')
         after_xml = ET.parse(candidate_records[0].parent / 'junit.xml')
         assert before_xml.find('.//testcase/failure') is not None

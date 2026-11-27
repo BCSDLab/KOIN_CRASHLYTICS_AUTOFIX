@@ -331,6 +331,30 @@ def attempt_merge(github: Any, job: dict[str, Any], *, bot_login: str) -> dict[s
     peer_merged, peer_error = _verify_peer_pull(github, job, pins, peer_target, identity_hash, bot_login)
     if peer_error is not None:
         return peer_error
+    try:
+        manifest = InvestigationQueue(github).get_publication(job['headSha'], target)
+    except (ValueError, TypeError):
+        return _blocked('candidate publication metadata is invalid or tampered')
+    if manifest is None:
+        return _blocked('candidate publication metadata is missing')
+    try:
+        digest = manifest_digest(manifest)
+    except (ValueError, TypeError):
+        return _blocked('candidate publication metadata is invalid')
+    if digest != job['manifestDigest']:
+        return _blocked('candidate publication digest does not match the scheduled job')
+    is_current_branch = _is_current_issue_branch(pr, job['issueNumber'])
+    if not is_current_branch or manifest.get('version') != 4:
+        return _blocked('pull request branch and manifest versions do not match')
+    expected_manifest = {
+        'issueId': job['alert']['issueId'],
+        'identityHash': identity_hash,
+        'baseSha': job['baseSha'],
+    }
+    if manifest.get('version') == 4:
+        expected_manifest['issueNumber'] = job['issueNumber']
+    if not validate_manifest(manifest, expected_manifest)['valid']:
+        return _blocked('candidate manifest is invalid')
     if pr.get('merged'):
         if pr['base'].get('ref') == target and pr['head'].get('sha') == job['headSha']:
             return _merged(complete=peer_merged)
@@ -348,30 +372,6 @@ def attempt_merge(github: Any, job: dict[str, Any], *, bot_login: str) -> dict[s
     ref = github.rest('GET', f'{REPOSITORY_PATH}/git/ref/heads/{target}')
     if ref.get('object', {}).get('sha') != job['baseSha']:
         return _pending(f'{target} advanced after the merge was scheduled; a fresh candidate is required')
-    try:
-        manifest = InvestigationQueue(github).get_publication(job['headSha'], target)
-    except (ValueError, TypeError):
-        return _blocked('candidate publication metadata is invalid or tampered')
-    if manifest is None:
-        return _blocked('candidate publication metadata is missing')
-    try:
-        digest = manifest_digest(manifest)
-    except (ValueError, TypeError):
-        return _blocked('candidate publication metadata is invalid')
-    if digest != job['manifestDigest']:
-        return _blocked('candidate publication digest does not match the scheduled job')
-    is_current_branch = _is_current_issue_branch(pr, job['issueNumber'])
-    if not is_current_branch or manifest.get('version') != 3:
-        return _blocked('pull request branch and manifest versions do not match')
-    expected_manifest = {
-        'issueId': job['alert']['issueId'],
-        'identityHash': identity_hash,
-        'baseSha': job['baseSha'],
-    }
-    if manifest.get('version') == 3:
-        expected_manifest['issueNumber'] = job['issueNumber']
-    if not validate_manifest(manifest, expected_manifest)['valid']:
-        return _blocked('candidate manifest is invalid')
     branch_base_sha = manifest.get('branchBaseSha', manifest['baseSha'])
     commit = github.rest('GET', f"{REPOSITORY_PATH}/commits/{job['headSha']}")
     parents = commit.get('parents') if isinstance(commit, dict) else None

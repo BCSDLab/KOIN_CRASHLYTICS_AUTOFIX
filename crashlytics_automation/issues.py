@@ -212,7 +212,7 @@ def _crash_report_body(context: CrashContext, reason: str, config: dict[str, Any
                 lines.extend(safe_text(line, 1000) for line in analysis[:6000].splitlines())
             verification = result.get('verification')
             if isinstance(verification, dict):
-                lines.append('* 독립 실행 검증: ' + ('수정 전 회귀 실패 · 수정 후 통과'
+                lines.append('* 독립 실행 검증: ' + ('크래시: 원본 실패·수정본 통과 / 기존 동작 계약: 원본·수정본 통과'
                              if verification.get('passed') is True else safe_text(verification.get('reason', UNKNOWN), 1000)))
             if result.get('source'):
                 lines.append(f'* 조사 대상: {safe_text(result["source"], 500)}')

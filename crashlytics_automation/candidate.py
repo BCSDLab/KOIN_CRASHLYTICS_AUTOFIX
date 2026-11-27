@@ -17,8 +17,8 @@ from .repository import REPOSITORY, TARGET_BRANCHES
 MAX_CANDIDATE_FILES = 24
 MAX_FILE_BYTES = 256 * 1024
 MAX_TOTAL_BYTES = 1024 * 1024
-MANIFEST_VERSION = 3
-LEGACY_MANIFEST_VERSIONS = (1, 2)
+MANIFEST_VERSION = 4
+LEGACY_MANIFEST_VERSIONS = (1, 2, 3)
 
 SHA40 = re.compile(r'[0-9a-f]{40}')
 SHA64 = re.compile(r'[0-9a-f]{64}')
@@ -35,6 +35,7 @@ MANIFEST_KEYS = (
     'baseSha', 'sourceSha', 'sourcePath', 'files',
 )
 MANIFEST_KEYS_V3 = (*MANIFEST_KEYS, 'issueNumber', 'branchBaseSha')
+MANIFEST_KEYS_V4 = (*MANIFEST_KEYS_V3, 'verification')
 FILE_KEYS = ('path', 'kind', 'beforeSha256', 'afterSha256')
 
 # Collation order used by the published JS artifacts: primary weights ignore
@@ -103,7 +104,7 @@ def regression_test_name(identity_hash: Any) -> str:
 
 
 def _test_path_pattern(identity_hash: str) -> re.Pattern[str]:
-    name = re.escape(regression_test_name(identity_hash).removesuffix('.kt'))
+    name = rf'(?:CrashlyticsRegression|CrashlyticsPreservation){_require_identity_hash(identity_hash)[:12]}Test'
     return re.compile(
         rf'^({MODULE})/src/(?:test|androidTest)/(?:java|kotlin)/(?:({PACKAGE_DIR})/)?'
         rf'{name}\.(?:kt|java)$'
@@ -252,6 +253,7 @@ def candidate_manifest(
     source_sha: Any,
     source_path: Any,
     files: Any,
+    verification: Any,
 ) -> dict[str, Any]:
     if type(issue_number) is not int or not 0 < issue_number <= 2**53 - 1:
         raise TypeError('Invalid issue number')
@@ -293,6 +295,8 @@ def candidate_manifest(
             'path': path, 'kind': kind,
             'beforeSha256': before_sha256, 'afterSha256': after_sha256,
         })
+    from .behavior import validate_verified_checks
+    validate_verified_checks(entries, verification)
 
     entries.sort(key=lambda entry: path_sort_key(entry['path']))
     return {
@@ -305,6 +309,7 @@ def candidate_manifest(
         'sourceSha': source_sha,
         'sourcePath': source_path,
         'files': entries,
+        'verification': verification,
     }
 
 
@@ -320,7 +325,9 @@ def validate_manifest(manifest: Any, expected: Mapping[str, Any] | None = None) 
     """
     expected = expected or {}
     version = manifest.get('version') if isinstance(manifest, dict) else None
-    keys = MANIFEST_KEYS_V3 if version == MANIFEST_VERSION else MANIFEST_KEYS
+    keys = MANIFEST_KEYS_V4 if version == MANIFEST_VERSION else (
+        MANIFEST_KEYS_V3 if version == 3 else MANIFEST_KEYS
+    )
     if not _has_exact_keys(manifest, keys):
         return {'valid': False, 'reason': 'manifest 형식이 올바르지 않습니다.'}
     if type(version) is not int or version not in (*LEGACY_MANIFEST_VERSIONS, MANIFEST_VERSION):
@@ -335,7 +342,7 @@ def validate_manifest(manifest: Any, expected: Mapping[str, Any] | None = None) 
         or not isinstance(source_sha, str) or not SHA40.fullmatch(source_sha)
     ):
         return {'valid': False, 'reason': 'manifest의 SHA 값이 올바르지 않습니다.'}
-    if version == MANIFEST_VERSION and (
+    if version in (3, MANIFEST_VERSION) and (
         not isinstance(manifest['branchBaseSha'], str)
         or not SHA40.fullmatch(manifest['branchBaseSha'])
     ):
@@ -348,17 +355,17 @@ def validate_manifest(manifest: Any, expected: Mapping[str, Any] | None = None) 
         or expected_identity != identity_hash
     ):
         return {'valid': False, 'reason': 'manifest의 identityHash가 일치하지 않습니다.'}
-    if version == MANIFEST_VERSION:
+    if version in (3, MANIFEST_VERSION):
         issue_number = manifest['issueNumber']
         if type(issue_number) is not int or not 0 < issue_number <= 2**53 - 1:
             return {'valid': False, 'reason': 'manifest의 issueNumber가 올바르지 않습니다.'}
     for key in ('issueId', 'identityHash', 'baseSha', 'sourceSha', 'sourcePath'):
         if key in expected and expected[key] != manifest[key]:
             return {'valid': False, 'reason': f'manifest의 {key} 값이 예상과 다릅니다.'}
-    if version == MANIFEST_VERSION and 'issueNumber' in expected \
+    if version in (3, MANIFEST_VERSION) and 'issueNumber' in expected \
             and expected['issueNumber'] != manifest['issueNumber']:
         return {'valid': False, 'reason': 'manifest의 issueNumber 값이 예상과 다릅니다.'}
-    if version == MANIFEST_VERSION and 'branchBaseSha' in expected \
+    if version in (3, MANIFEST_VERSION) and 'branchBaseSha' in expected \
             and expected['branchBaseSha'] != manifest['branchBaseSha']:
         return {'valid': False, 'reason': 'manifest의 branchBaseSha 값이 예상과 다릅니다.'}
     if not is_allowed_source_path(manifest['sourcePath']):
@@ -407,4 +414,10 @@ def validate_manifest(manifest: Any, expected: Mapping[str, Any] | None = None) 
         return {'valid': False, 'reason': 'manifest에 소스와 회귀 테스트가 모두 필요합니다.'}
     if any(module not in source_modules for module in test_modules):
         return {'valid': False, 'reason': 'manifest의 회귀 테스트 모듈이 소스 모듈과 다릅니다.'}
+    if version == MANIFEST_VERSION:
+        from .behavior import validate_verified_checks
+        try:
+            validate_verified_checks(files, manifest['verification'])
+        except (ValueError, TypeError) as error:
+            return {'valid': False, 'reason': f'기능 보존 검증이 올바르지 않습니다: {error}'}
     return {'valid': True, 'manifest': manifest, 'digest': manifest_digest(manifest)}

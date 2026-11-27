@@ -14,7 +14,7 @@ from .repository import REPOSITORY, REPOSITORY_PATH, STATE_REFERENCE, TARGET_BRA
 from .task_payloads import parse_alert_payload
 
 POLICY_VERSION = 2
-PROPOSAL_VERSION = 1
+PROPOSAL_VERSION = 2
 PUBLICATION_VERSION = 2
 MAX_PUBLICATION_BYTES = 64 * 1024
 DEFAULT_ATTEMPT_LIMIT = 3
@@ -41,6 +41,7 @@ def new_job(alert: CrashAlert, evidence: dict[str, Any], issue_number: int) -> d
     return {
         'version': POLICY_VERSION,
         'id': job_id(alert),
+        'verificationPolicy': 2,
         'status': 'queued',
         'alert': alert.to_payload(),
         'issueNumber': issue_number,
@@ -64,6 +65,8 @@ def validate_job(job: Any) -> None:
     evidence = job.get('evidence')
     if not isinstance(evidence, dict) or evidence.get('status') != 'ready':
         raise ValueError('Investigation requires exported event evidence')
+    if 'verificationPolicy' in job and job['verificationPolicy'] != 2:
+        raise ValueError('Invalid behavior verification policy')
     for name in ('branches', 'analyses', 'attempts', 'verificationAttempts'):
         value = job.get(name, {})
         if not isinstance(value, dict) or not set(value).issubset(TARGET_BRANCHES):
@@ -110,6 +113,8 @@ def validate_job(job: Any) -> None:
 
 
 def _available(job: dict[str, Any], now: datetime) -> bool:
+    if job.get('branches') and job.get('verificationPolicy') != 2:
+        return False
     if job['status'] in ('manual', 'merging', 'complete') and job.get('reportPending') is True:
         return True
     if job['status'] in ('queued', 'delivering'):
@@ -134,7 +139,7 @@ def proposal_envelope(
         'identity': {'jobId': job['id'], 'target': target, 'releaseSha': release_sha,
                      'branchBaseSha': branch_base_sha, 'baseSha': base_sha},
         'proposal': {key: decision[key] for key in (
-            'decision', 'analysis', 'reason', 'sourcePath', 'sourceLine', 'files',
+            'decision', 'analysis', 'reason', 'sourcePath', 'sourceLine', 'files', 'behaviorReview',
         )},
     }
 
@@ -263,6 +268,8 @@ class InvestigationQueue:
             not isinstance(decision.get('reason'), str) or not decision['reason'].strip()
         ):
             raise ValueError('Proposal has no complete source-anchored analysis')
+        from .behavior import validate_review_binding
+        validate_review_binding(files, decision.get('behaviorReview'))
         envelope = proposal_envelope(
             job, target, {**decision, 'files': normalized}, release_sha=release_sha,
             branch_base_sha=branch_base_sha, base_sha=base_sha,
@@ -322,7 +329,7 @@ class InvestigationQueue:
             raise ValueError('Stale or malformed proposal identity')
         proposal = envelope.get('proposal')
         if not isinstance(proposal, dict) or set(proposal) != {
-            'decision', 'analysis', 'reason', 'sourcePath', 'sourceLine', 'files',
+            'decision', 'analysis', 'reason', 'sourcePath', 'sourceLine', 'files', 'behaviorReview',
         } or proposal.get('decision') != 'fix' or (
             not isinstance(proposal.get('analysis'), str) or not proposal['analysis'].strip()
             or not isinstance(proposal.get('reason'), str) or not proposal['reason'].strip()
@@ -362,6 +369,8 @@ class InvestigationQueue:
                 raise ValueError('Malformed proposal file hash or size')
         if kinds != {'source', 'test'}:
             raise ValueError('Proposal must include a source change and regression test')
+        from .behavior import validate_review_binding
+        validate_review_binding(files, proposal.get('behaviorReview'))
         return envelope
 
     def _read_publication(self, head_sha: str, base_branch: str, blob_sha: str) -> dict[str, Any]:

@@ -130,6 +130,8 @@ def prepare_existing_issue(
             time.sleep(5)
         if job is None:
             raise RuntimeError('Evidence snapshot task did not publish investigation state within three minutes')
+    if job.get('branches') and job.get('verificationPolicy') != 2:
+        return job
     changed = False
     if resume_manual:
         if job['status'] not in ('manual', 'queued'):
@@ -268,20 +270,10 @@ def _baseline(target: Path, files: list[dict[str, Any]], identity_hash: str) -> 
 
 
 def _validate_verified_checks(decision: dict[str, Any], verification: dict[str, Any]) -> None:
-    paths = {file['path'] for file in decision['files'] if file['kind'] == 'test'}
-    checks = verification.get('checks')
-    if verification.get('passed') is not True or not isinstance(checks, list) or not paths:
-        raise ValueError('Saved candidate has no complete trusted verification')
-    for path in paths:
-        before = [check for check in checks if check.get('path') == path and check.get('phase') == 'baseline']
-        after = [check for check in checks if check.get('path') == path and check.get('phase') == 'candidate']
-        if len(before) != 1 or len(after) != 1 or (
-            before[0].get('timed_out') is not False or before[0].get('exit_code') in (None, 0)
-            or before[0].get('test_result') not in ('failed', 'fatal-oom')
-            or after[0].get('timed_out') is not False or after[0].get('exit_code') != 0
-            or after[0].get('test_result') != 'passed'
-        ):
-            raise ValueError('Saved candidate lacks reproduced-before and passed-after evidence')
+    from .behavior import validate_verified_checks
+    validate_verified_checks(decision['files'], verification)
+    if decision.get('behaviorReview') != verification.get('behaviorReview'):
+        raise ValueError('Verification does not bind the approved behavior review')
 
 
 def _verified_candidate(queue: Any, job: dict[str, Any], release: str, origin: str) -> Any:
@@ -292,7 +284,7 @@ def _verified_candidate(queue: Any, job: dict[str, Any], release: str, origin: s
         return None
     if not isinstance(record, dict) or set(record) != {
         'version', 'target', 'proposalSha', 'releaseSha', 'branchBaseSha', 'source', 'verification',
-    } or record['version'] != 1 or record['target'] not in TARGET_BRANCHES:
+    } or record['version'] != 2 or record['target'] not in TARGET_BRANCHES:
         raise ValueError('Malformed verified proposal checkpoint')
     target = record['target']
     if record['releaseSha'] != release or record['branchBaseSha'] != origin or (
@@ -385,6 +377,8 @@ def run_job(github: Any, config: dict[str, Any], job: dict[str, Any]) -> dict[st
 
     queue = InvestigationQueue(github)
     context = _context(job)
+    if job.get('branches') and job.get('verificationPolicy') != 2:
+        return {'outcome': 'held-existing', 'issueNumber': context.issue_number}
     if job.get('status') == 'manual':
         if job.get('reportPending') is True:
             return _report(github, queue, job, config) or {
@@ -409,6 +403,7 @@ def run_job(github: Any, config: dict[str, Any], job: dict[str, Any]) -> dict[st
         if target is None:
             return _deliver(github, queue, job, config)
         attempts = job['attempts'].get(target, 0)
+        job['verificationPolicy'] = 2
         job['status'] = 'running'
         job['startedAt'] = datetime.now(timezone.utc).isoformat()
         if os.environ.get('GITHUB_RUN_ID', '').isdigit():
@@ -530,13 +525,15 @@ def run_job(github: Any, config: dict[str, Any], job: dict[str, Any]) -> dict[st
                     trace_path = sandbox.artifact_directory / 'investigation-tool-results.jsonl'
                     trace_path.parent.mkdir(parents=True, exist_ok=True)
 
-                    def execute_and_record(*, command: str, timeout_seconds: int) -> dict[str, Any]:
-                        result = sandbox.execute(command=command, timeout_seconds=timeout_seconds)
+                    def execute_and_record(*, command: str, timeout_seconds: int, review: bool = False) -> dict[str, Any]:
+                        executor = sandbox.execute_review if review else sandbox.execute
+                        result = executor(command=command, timeout_seconds=timeout_seconds)
                         safe_result = dict(result)
                         for field in ('stdout', 'stderr'):
                             if isinstance(safe_result.get(field), str):
                                 safe_result[field] = _redact_secrets(safe_result[field])
-                        record = {'command': _redact_secrets(command), **safe_result}
+                        record = {'phase': 'behavior-review' if review else 'investigation',
+                                  'command': _redact_secrets(command), **safe_result}
                         with trace_path.open('a', encoding='utf-8') as trace:
                             trace.write(json.dumps(record, ensure_ascii=False) + '\n')
                         tool_trace.append(record)
@@ -556,11 +553,17 @@ def run_job(github: Any, config: dict[str, Any], job: dict[str, Any]) -> dict[st
                                 'pullRequestTargets': list(TARGET_BRANCHES),
                                 'operatorNotes': job.get('operatorNotes'),
                                 'priorInvestigations': job['analyses'],
+                                'preservation': job.get('preservation'),
+                                'verificationFeedback': job['analyses'].get(target, {}).get('verification'),
                                 'baseSha': branch_base, 'crash': job['evidence'], 'identityHash': identity_hash,
                                 'regressionTestName': regression_test_name(identity_hash),
                                 'workspaces': {'release': '/workspace/release', 'target': '/workspace/target',
                                                'scratch': '/workspace/scratch'},
                             }, execute=execute_and_record,
+                            read_baseline=lambda paths: _baseline(
+                                root / 'target', [{'path': path} for path in paths], identity_hash,
+                            ),
+                            review_execute=lambda **arguments: execute_and_record(**arguments, review=True),
                         )
                     if decision.get('toolResults'):
                         (sandbox.artifact_directory / 'investigation-tool-results.json').write_text(
@@ -608,10 +611,20 @@ def run_job(github: Any, config: dict[str, Any], job: dict[str, Any]) -> dict[st
                         raise RuntimeError('The trusted verification retry limit was reached')
                     job['verificationAttempts'][target] = retries + 1
                     queue.put(job)
-                    verification = sandbox.verify_candidate(files=validated['files'], identity_hash=identity_hash)
+                    verification = sandbox.verify_candidate(
+                        files=validated['files'], identity_hash=identity_hash,
+                        behavior_review=decision['behaviorReview'],
+                    )
+                    (sandbox.artifact_directory / 'verification.json').write_text(
+                        json.dumps(_redact_diagnostic(verification), ensure_ascii=False, indent=2),
+                        encoding='utf-8',
+                    )
+                    if verification.get('passed') is True:
+                        _validate_verified_checks(decision, verification)
                     job['analyses'][target]['verification'] = {
                         'passed': verification.get('passed') is True, 'reason': str(verification.get('reason', ''))[:2000],
                         'retryable': verification.get('retryable') is True,
+                        'checks': _redact_diagnostic(verification.get('checks', [])),
                     }
                     if verification.get('passed') is not True:
                         reason = verification.get('reason') or 'Independent reproduction verification failed'
@@ -621,15 +634,42 @@ def run_job(github: Any, config: dict[str, Any], job: dict[str, Any]) -> dict[st
                             _report(github, queue, job, config)
                             return {'outcome': 'queued', 'issueNumber': context.issue_number,
                                     'baseBranch': target, 'verificationRetry': retries + 1}
+                        if verification.get('retryable') is False and (
+                            job['attempts'].get(target, 0) < job.get('attemptLimits', {}).get(target, DEFAULT_ATTEMPT_LIMIT)
+                            and retries + 1 < MAX_VERIFICATION_ATTEMPTS
+                        ):
+                            from .behavior import preservation_test_name
+                            preservation_files = [
+                                {'path': file['path'], 'content': file['content']} for file in validated['files']
+                                if file['path'].endswith(preservation_test_name(identity_hash))
+                            ]
+                            baseline_checks = [
+                                check for check in verification.get('checks', [])
+                                if check.get('phase') == 'baseline' and check.get('purpose') == 'preservation'
+                            ]
+                            if baseline_checks and {check['path'] for check in baseline_checks} == {
+                                file['path'] for file in preservation_files
+                            } and all(
+                                check.get('exit_code') == 0 and check.get('timed_out') is False
+                                and check.get('test_result') == 'passed' for check in baseline_checks
+                            ):
+                                job['preservation'] = {
+                                    'contracts': decision['behaviorReview']['contracts'], 'files': preservation_files,
+                                }
+                            job.get('proposals', {}).pop(target, None)
+                            job['status'], job['reason'] = 'queued', _redact_secrets(str(reason))
+                            queue.put(job)
+                            _report(github, queue, job, config)
+                            return {'outcome': 'queued', 'issueNumber': context.issue_number,
+                                    'baseBranch': target, 'behaviorRepair': True}
                         raise ValueError(reason)
                     source = resolve_investigated_source(github, release_sha=release,
                                                         path=decision['sourcePath'], line=decision['sourceLine'])
                     if isinstance(source, ManualReview):
                         raise ValueError(source.reason)
-                    _validate_verified_checks(decision, verification)
                     job['analyses'][target]['source'] = f'{source.path}:{source.line}'
                     job['verifiedProposal'] = {
-                        'version': 1, 'target': target, 'proposalSha': job['proposals'][target],
+                        'version': 2, 'target': target, 'proposalSha': job['proposals'][target],
                         'releaseSha': release, 'branchBaseSha': branch_base,
                         'source': source.to_payload(), 'verification': _redact_diagnostic(verification),
                     }

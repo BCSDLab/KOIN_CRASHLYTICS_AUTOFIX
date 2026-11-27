@@ -35,10 +35,7 @@ class CrashAutomation:
 
     def process_fix_task(self, data: dict[str, Any], *, retry_count: int = 0) -> dict[str, Any]:
         context = CrashContext(parse_fix_task(data))
-        if self.bigquery_client is None:
-            raise ValueError('Investigation preparation requires BigQuery')
         try:
-            context.issue_number = ensure_crash_issue(self.github, context, self.config)
             decision = self._prepare_fix(context, retry_count)
         except Exception:
             if retry_count < MAX_FIX_RETRIES:
@@ -55,6 +52,11 @@ class CrashAutomation:
     def _prepare_fix(self, context: CrashContext, retry_count: int) -> dict[str, Any] | ManualReview:
         queue = InvestigationQueue(self.github)
         job = queue.get(context.alert)
+        if job is not None and job.get('branches') and job.get('verificationPolicy') != 2:
+            return {'outcome': 'held-existing', 'issueNumber': job['issueNumber']}
+        if job is None and self.bigquery_client is None:
+            raise ValueError('Investigation preparation requires BigQuery')
+        context.issue_number = ensure_crash_issue(self.github, context, self.config)
         if job is None:
             context.evidence = find_evidence(self.bigquery_client, self.config, context.alert.to_payload())
             if context.evidence is None:
@@ -89,6 +91,8 @@ class CrashAutomation:
         investigation = queue.get(context.alert)
         if investigation is None:
             return {'outcome': 'superseded', 'issueNumber': context.issue_number}
+        if investigation.get('verificationPolicy') != 2:
+            return {'outcome': 'held-existing', 'issueNumber': context.issue_number}
         expected = {branch: {'number': fix['pullNumber'], 'headSha': fix['headSha']}
                     for branch, fix in investigation['branches'].items()}
         if investigation['status'] not in ('delivering', 'merging', 'complete') or expected != job['pullRequests']:

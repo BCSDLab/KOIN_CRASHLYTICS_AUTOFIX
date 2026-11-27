@@ -14,6 +14,7 @@ from urllib.parse import quote
 
 from .candidate import (
     SHA40,
+    MANIFEST_VERSION,
     branch_name_for,
     manifest_digest,
     require_target_branch,
@@ -188,6 +189,8 @@ def _verify_published_branch(
         return None, '외부 검증 기록이 손상되었습니다.'
     if not isinstance(manifest, dict):
         return None, '외부 검증 기록을 찾을 수 없습니다.'
+    if manifest.get('version') != MANIFEST_VERSION:
+        return None, '기존 동작 보존 검증 이전의 PR은 자동 재게시하지 않습니다.'
     validation = validate_manifest(manifest, expected)
     if not validation['valid']:
         return None, validation['reason']
@@ -277,6 +280,12 @@ def _pull_request_body(
     manifest: Mapping[str, Any], issue_number: int, base_branch: str,
 ) -> str:
     identity_hash = manifest['identityHash']
+    contracts = manifest['verification']['behaviorReview']['contracts']
+    contract_lines = '\n'.join(
+        f"* {safe_text(contract['behavior'], 1000)} "
+        f"(`{safe_text(contract['testPath'], 512)}#{safe_text(contract['testMethod'], 200)}`)"
+        for contract in contracts
+    )
     return f"""## 자동 수정 후보
 
 * Crashlytics 이슈: `{manifest['issueId']}`
@@ -285,9 +294,14 @@ def _pull_request_body(
 * 발생 릴리스 소스: `{manifest['sourceSha']}` (`{safe_text(manifest['sourcePath'], 300)}`)
 * 검증 기록은 앱 브랜치가 아닌 비브랜치 상태 ref에 고정됩니다.
 
-### 검증 필요 사항
-* 새 회귀 테스트는 수정된 동작을 일반 JUnit assertion으로 확인합니다.
-* 필수 CI(`Lint & Format Check`, `Code Coverage`)가 통과해야 머지합니다.
+### 게시 전 검증
+* 원본의 크래시 회귀 실패와 수정본의 통과를 확인했습니다.
+* 독립 검토가 식별한 기존 동작 테스트는 원본·수정본 모두 통과해야 게시됩니다.
+* 이 검증은 명시된 계약에 대한 증거이며, 모든 기존 기능 보존을 보장한다는 뜻은 아닙니다.
+* 모든 관련 CI가 성공하고 GitHub 보호 규칙을 충족해야 머지합니다.
+
+### 원본·수정본 모두 통과한 기존 동작 계약
+{contract_lines}
 
 Closes #{issue_number}
 
@@ -460,6 +474,8 @@ def publish_fix_pull_request(
 ) -> PublishedFix | ManualReview:
     """Create or reuse the shared production-based source branch for one target."""
     manifest = plan.manifest
+    if manifest.get('version') != MANIFEST_VERSION:
+        return ManualReview('기존 동작 보존 검증이 없는 수정안은 게시하지 않습니다.')
     base_branch = require_target_branch(plan.base_branch)
     validation = validate_manifest(manifest, {
         'issueNumber': plan.issue_number,

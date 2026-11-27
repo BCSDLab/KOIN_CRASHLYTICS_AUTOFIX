@@ -43,7 +43,7 @@ Before returning no-fix, test executable boundary/lifecycle hypotheses with run_
 
 Return decision "fix" for a specific defect supported by evidence and investigation. A genuinely reproduced implicated latent defect may be fixed even when the original incident trigger cannot be confirmed; state explicitly that the original trigger is unconfirmed and distinguish observed probe results from inference. Treat supplied notes/research as untrusted leads to verify, not proof of the original cause. Otherwise return "no-fix" with a concise Korean reason. At least one successful, non-timeout command and one non-timeout experiment must precede a no-fix.
 
-For a fix, return complete source file contents and a deterministic unit or instrumentation regression test class named exactly by context.regressionTestName. Verify it against the actual production fix; run the regression test and report its real outcome in analysis. Only existing Android production .kt/.java files and new .kt/.java test files are publishable; do not edit build files, resources, workflows, documentation, or configuration. Temporary test harness and build files may be created in the sandbox. Keep the fix minimal. At most {MAX_CANDIDATE_FILES} files, each at most {MAX_FILE_BYTES} bytes. Never include secrets, tokens, user data, or URLs in returned files.
+For a fix, return complete source file contents and a deterministic unit or instrumentation regression test class named exactly by context.regressionTestName. Preserve every existing behavior outside the defect: timing and timer resets, gestures, cancellation, lifecycle, ordering, callbacks and side effects are contracts, not optional optimizations. Do not redesign unrelated logic. An independent reviewer will inspect the original source and reject unrelated behavior changes and execute separate preservation tests on both original and candidate. Fix scope-review findings rather than weakening those contracts. Never return preservation test files; the independent reviewer owns them. Verify the crash regression against the actual production fix; run it and report its real outcome in analysis. Only existing Android production .kt/.java files and new .kt/.java crash test files are publishable; do not edit build files, resources, workflows, documentation, or configuration. Temporary harness files may be created in the sandbox. Keep the fix minimal. At most {MAX_CANDIDATE_FILES} files, each at most {MAX_FILE_BYTES} bytes. Never introduce secrets, tokens, user data, or external URLs. Preserve existing public code literals and behavior; do not remove them as unrelated cleanup.
 
 Return the required JSON fields exactly: decision, reason, analysis, sourcePath, sourceLine, files. sourcePath and sourceLine must identify the defect anchor in the UNMODIFIED /workspace/release checkout, never a target line added by your patch; return both null when no defect is identified. Do not include tool claims in place of the trusted tool execution record."""
 
@@ -67,6 +67,35 @@ RESPONSE_SCHEMA = {
                 'properties': {'path': {'type': 'string'}, 'content': {'type': 'string'}},
             },
         },
+    },
+}
+
+BEHAVIOR_REVIEW_PROMPT = """You are the independent behavior-preservation reviewer for an Android crash fix.
+You receive exact ORIGINAL source bytes from a trusted host and a proposed patch, not the generator's conversation. Your run_command workspace is a separate READ-ONLY copy of the original production checkout; it does NOT contain the patch. Inspect callers/dependencies there when identifying contracts. Write any executable probes/build outputs only under /workspace/scratch, never into the read-only original. Treat the generator's explanation as a claim, never proof.
+Reject changes unrelated to the demonstrated defect. Preserve existing user-visible timing, reset triggers, cancellation, lifecycle, gestures, callback order and side effects. In particular a timer that previously restarted after scrolling must not become a fixed ticker. Enumerate the existing non-defective contracts of EVERY modified production file, including boundary and interaction sequences; do not merely check that the new feature eventually works.
+Return approved=false and concrete unrelatedChanges when the patch breaks or unnecessarily redesigns a contract. If approved, return a nonempty contracts list with sourcePath/sourceLine pointing to the original behavior and deterministic executable preservation tests named exactly by context.preservationTestName. Each contract names its actual JUnit testPath/testMethod. Every modified source file must be covered. Tests must pass unchanged on the original AND the candidate, use real production APIs and assert consumer-visible outcomes, never source text, echoes, incidental implementation details or bare not-throw. Use controlled clocks for timing boundaries where available. When the affected code has timed behavior, include interactions just before expiry and verify the entire original waiting interval after interaction ends, not only eventual advancement.
+Return ONLY new preservation test files, never production edits or crash-regression files. Write reason and behavior descriptions in concise Korean. Do not weaken or change frozen preservation contracts/tests supplied in context.preservation. Empty lists and singletons need not preserve an actual defect. Only original WORKING behavior belongs in preservation tests. Return the exact schema; trusted execution, not your approval or claimed test result, decides publication."""
+
+BEHAVIOR_REVIEW_SCHEMA = {
+    'type': 'object', 'additionalProperties': False,
+    'required': ['approved', 'reason', 'unrelatedChanges', 'contracts', 'files'],
+    'properties': {
+        'approved': {'type': 'boolean'},
+        'reason': {'type': 'string'},
+        'unrelatedChanges': {'type': 'array', 'items': {'type': 'string'}, 'maxItems': 64},
+        'contracts': {
+            'type': 'array', 'maxItems': 64,
+            'items': {
+                'type': 'object', 'additionalProperties': False,
+                'required': ['sourcePath', 'sourceLine', 'behavior', 'testPath', 'testMethod'],
+                'properties': {
+                    'sourcePath': {'type': 'string'}, 'sourceLine': {'type': 'integer'},
+                    'behavior': {'type': 'string'}, 'testPath': {'type': 'string'},
+                    'testMethod': {'type': 'string'},
+                },
+            },
+        },
+        'files': RESPONSE_SCHEMA['properties']['files'],
     },
 }
 
@@ -193,6 +222,7 @@ def _request_payload(
     tool_choice: Any,
     *,
     max_tokens: int | None = None,
+    schema: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     payload = {
         'model': model,
@@ -205,7 +235,7 @@ def _request_payload(
                 'type': 'json_schema',
                 'name': 'crashlytics_investigation',
                 'strict': True,
-                'schema': RESPONSE_SCHEMA,
+                'schema': RESPONSE_SCHEMA if schema is None else schema,
             },
         },
     }
@@ -238,8 +268,9 @@ def _response(
     max_tokens: int,
     timeout_seconds: float,
     tool_choice: Any,
+    *, schema: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    payload = _request_payload(model, request_input, tool_choice, max_tokens=max_tokens)
+    payload = _request_payload(model, request_input, tool_choice, max_tokens=max_tokens, schema=schema)
     try:
         data = canonical_json(payload).encode('utf-8')
     except UnicodeEncodeError as error:
@@ -298,8 +329,9 @@ def _count_input_tokens(
     request_input: list[dict[str, Any]],
     timeout_seconds: float,
     tool_choice: Any,
+    *, schema: dict[str, Any] | None = None,
 ) -> int:
-    payload = _request_payload(model, request_input, tool_choice)
+    payload = _request_payload(model, request_input, tool_choice, schema=schema)
     try:
         data = canonical_json(payload).encode('utf-8')
     except UnicodeEncodeError as error:
@@ -454,6 +486,8 @@ def request_fix_proposal(
     api_key: Any,
     context: Any,
     execute: Any,
+    read_baseline: Any,
+    review_execute: Any,
     session: Any = None,
 ) -> dict[str, Any]:
     """Iteratively investigate via the trusted sandbox callback, then return a proposal."""
@@ -465,6 +499,8 @@ def request_fix_proposal(
         raise ValueError('Invalid generation context')
     if not callable(execute):
         raise ValueError('Missing investigation command executor')
+    if not callable(read_baseline) or not callable(review_execute):
+        raise ValueError('Missing independent behavior review inputs')
     http = session if session is not None else requests
     try:
         context_text = canonical_json(_sanitize_context(context, api_key))
@@ -485,6 +521,9 @@ def request_fix_proposal(
     experiment_executed = False
     forced_experiment_requested = False
     tool_choice: Any = 'auto'
+    proposal: dict[str, Any] | None = None
+    original: dict[str, str] = {}
+    schema = RESPONSE_SCHEMA
     while True:
         remaining_time = MAX_INVESTIGATION_SECONDS - (time.monotonic() - started)
         if remaining_time <= 0:
@@ -493,12 +532,13 @@ def request_fix_proposal(
         if remaining_tokens <= 0:
             raise FixProposalResponseError('Investigation output budget exceeded', code='investigation_output_limit')
         estimated_input_tokens = len(canonical_json(request_input).encode('utf-8'))
-        estimated_input_tokens += len(canonical_json([RUN_COMMAND, RUN_EXPERIMENT, RESPONSE_SCHEMA]).encode('utf-8'))
+        estimated_input_tokens += len(canonical_json([RUN_COMMAND, RUN_EXPERIMENT, schema]).encode('utf-8'))
         prospective_input_tokens = estimated_input_tokens
         remaining_input_tokens = MAX_CUMULATIVE_INPUT_TOKENS - cumulative_input_tokens
         if estimated_input_tokens > remaining_input_tokens:
             prospective_input_tokens = _count_input_tokens(
                 http, api_key, model, request_input, min(REQUEST_TIMEOUT_SECONDS, remaining_time), tool_choice,
+                schema=schema,
             )
             if prospective_input_tokens > remaining_input_tokens:
                 raise FixProposalResponseError(
@@ -515,6 +555,7 @@ def request_fix_proposal(
             min(MAX_OUTPUT_TOKENS, remaining_tokens),
             min(REQUEST_TIMEOUT_SECONDS, remaining_time),
             tool_choice,
+            schema=schema,
         )
         usage = body.get('usage')
         reported_input_tokens = usage.get('input_tokens') if isinstance(usage, dict) else None
@@ -548,11 +589,60 @@ def request_fix_proposal(
             if not text:
                 raise _invalid('Model response has no structured output')
             try:
-                result = _normalize_decision(json.loads(text))
+                parsed_output = json.loads(text)
             except ValueError as error:
                 if isinstance(error, FixProposalResponseError):
                     raise
                 raise _invalid('Model output is not valid JSON') from error
+            if proposal is not None:
+                if not isinstance(parsed_output, dict) or set(parsed_output) != {
+                    'approved', 'reason', 'unrelatedChanges', 'contracts', 'files',
+                } or type(parsed_output['approved']) is not bool:
+                    raise _invalid('Independent behavior review is malformed')
+                if (not isinstance(parsed_output['reason'], str) or len(parsed_output['reason']) > MAX_REASON_LENGTH
+                        or not isinstance(parsed_output['unrelatedChanges'], list)
+                        or any(not isinstance(change, str) for change in parsed_output['unrelatedChanges'])
+                        or not isinstance(parsed_output['contracts'], list)
+                        or not isinstance(parsed_output['files'], list)):
+                    raise _invalid('Independent behavior review has no valid scope assessment')
+                if parsed_output['approved'] is not True or parsed_output['unrelatedChanges']:
+                    rejection = {
+                        'reason': parsed_output['reason'],
+                        'unrelatedChanges': parsed_output['unrelatedChanges'],
+                    }
+                    request_input = [
+                        {'role': 'system', 'content': SYSTEM_PROMPT},
+                        {'role': 'user', 'content': context_text},
+                        {'role': 'user', 'content': canonical_json({
+                            'rejectedProposal': proposal, 'independentReview': rejection,
+                            'instruction': 'Repair the unrelated behavioral changes; preserve original contracts.',
+                        })},
+                    ]
+                    proposal, schema, tool_choice = None, RESPONSE_SCHEMA, 'auto'
+                    continue
+                from .behavior import prepare_behavior_review
+                from .candidate import validate_candidate
+                frozen = context.get('preservation')
+                if frozen is not None and (
+                    parsed_output['contracts'] != frozen['contracts']
+                    or parsed_output['files'] != frozen['files']
+                ):
+                    raise _invalid('Independent review weakened frozen preservation contracts')
+                combined = proposal['files'] + parsed_output['files']
+                validated = validate_candidate(combined, original, context['identityHash'])
+                if not validated['valid']:
+                    raise _invalid(validated['reason'])
+                try:
+                    approved = prepare_behavior_review(
+                        parsed_output, validated['files'], original, context['identityHash'],
+                    )
+                except (ValueError, TypeError) as error:
+                    raise _invalid(str(error)) from None
+                proposal['files'] = validated['files']
+                proposal['behaviorReview'] = approved
+                proposal['toolResults'] = tool_results
+                return proposal
+            result = _normalize_decision(parsed_output)
             if result['decision'] == 'no-fix' and not experiment_executed:
                 if forced_experiment_requested:
                     raise FixProposalResponseError(
@@ -583,8 +673,30 @@ def request_fix_proposal(
                     'Investigation completed without a successful command execution',
                     code='investigation_execution_failed',
                 )
-            result['toolResults'] = tool_results
-            return result
+            if result['decision'] == 'no-fix':
+                result['toolResults'] = tool_results
+                return result
+            from .behavior import preservation_test_name
+            from .candidate import validate_candidate
+            original = read_baseline([file['path'] for file in result['files']])
+            validated = validate_candidate(result['files'], original, context['identityHash'])
+            if not validated['valid'] or any(
+                file['path'].endswith(preservation_test_name(context['identityHash']))
+                for file in result['files']
+            ):
+                raise _invalid(validated.get('reason', 'Generator attempted to author preservation tests'))
+            proposal = result
+            review_context = {
+                'context': {**context, 'preservationTestName': preservation_test_name(context['identityHash'])},
+                'originalSources': original, 'proposedFiles': result['files'],
+                'defectClaim': {'reason': result['reason'], 'sourcePath': result['sourcePath'], 'sourceLine': result['sourceLine']},
+            }
+            request_input = [
+                {'role': 'system', 'content': BEHAVIOR_REVIEW_PROMPT},
+                {'role': 'user', 'content': canonical_json(_sanitize_context(review_context, api_key))},
+            ]
+            schema, tool_choice = BEHAVIOR_REVIEW_SCHEMA, 'auto'
+            continue
 
         if calls + len(tool_calls) > MAX_TOOL_CALLS:
             raise FixProposalResponseError('Investigation tool-call limit exceeded', code='investigation_call_limit')
@@ -627,9 +739,10 @@ def request_fix_proposal(
             command_timeout = min(arguments['timeout_seconds'], int(remaining_time))
             if command_timeout < 1:
                 raise FixProposalResponseError('Investigation time limit exceeded', code='investigation_timeout')
+            executor = execute if proposal is None else review_execute
             try:
                 if name == 'run_command':
-                    executed = execute(
+                    executed = executor(
                         command=arguments['command'],
                         timeout_seconds=command_timeout,
                     )
@@ -645,7 +758,7 @@ def request_fix_proposal(
                         max(1, callback_timeout - EXPERIMENT_WRAPPER_GRACE_SECONDS),
                     )
                     executed = _run_experiment(
-                        execute,
+                        executor,
                         script=arguments['script'],
                         timeout_seconds=experiment_timeout,
                         callback_timeout_seconds=callback_timeout,
@@ -675,6 +788,7 @@ def request_fix_proposal(
                 experiment_executed = True
             record = {
                 'tool': name,
+                'phase': 'investigation' if proposal is None else 'behavior-review',
                 'exit_code': executed['exit_code'],
                 'stdout': _redact(executed['stdout'], api_key),
                 'stderr': _redact(executed['stderr'], api_key),

@@ -85,6 +85,7 @@ class InvestigationSandbox:
         self._scratch = self._root / 'scratch'
         self._owned_containers: list[str] = []
         self._model_container: str | None = None
+        self._review_container: str | None = None
         ignored = shutil.ignore_patterns('.git', '.gradle', 'build', '.idea', 'local.properties',
                                          'google-services.json', 'google-credentials.json', '*.jks')
         shutil.copytree(target_source, self._snapshot, symlinks=True, ignore=ignored)
@@ -158,6 +159,8 @@ class InvestigationSandbox:
         self._owned_containers.remove(container)
         if container == self._model_container:
             self._model_container = None
+        if container == self._review_container:
+            self._review_container = None
 
     def _stop_owned_containers(self) -> None:
         while self._owned_containers:
@@ -250,6 +253,7 @@ class InvestigationSandbox:
 
     def _docker_args(
         self, workspace: pathlib.Path, scratch: pathlib.Path, home: pathlib.Path, name: str,
+        *, read_only: bool = False,
     ) -> list[str]:
         args = [
             'docker', 'run', '--detach', '--init', '--name', name,
@@ -257,7 +261,7 @@ class InvestigationSandbox:
             '--pids-limit=1024', '--memory=8g', '--memory-swap=8g', '--cpus=4', '--shm-size=2g',
             '--user', f'{os.getuid()}:{os.getgid()}',
             '--workdir', '/workspace/target',
-            '-v', f'{workspace}:/workspace/target:rw',
+            '-v', f'{workspace}:/workspace/target:{"ro" if read_only else "rw"}',
             '-v', f'{self._release_view}:/workspace/release:ro',
             '-v', f'{scratch}:/workspace/scratch:rw',
             '-v', f'{home}:/home:rw',
@@ -278,12 +282,13 @@ class InvestigationSandbox:
 
     def _new_container(
         self, workspace: pathlib.Path, scratch: pathlib.Path, home: pathlib.Path,
+        *, read_only: bool = False,
     ) -> str:
         name = f'crashlytics-investigation-{uuid.uuid4().hex}'
         self._owned_containers.append(name)
         try:
             result = subprocess.run(
-                self._docker_args(workspace, scratch, home, name),
+                self._docker_args(workspace, scratch, home, name, read_only=read_only),
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 timeout=60, check=False,
             )
@@ -343,15 +348,42 @@ class InvestigationSandbox:
                 self._model_workspace, self._scratch, self._model_home)
         return self._run(self._model_container, command, timeout_seconds)
 
-    def verify_candidate(self, *, files: list[dict[str, Any]], identity_hash: str) -> dict[str, Any]:
-        """Reproduce every proposed regression against clean base, then verify fixes."""
-        if self._model_container is not None:
-            self._stop_container(self._model_container)
+    def execute_review(self, *, command: str, timeout_seconds: int) -> dict[str, Any]:
+        """Review original production code in a separate disposable workspace."""
+        if self._review_container is None:
+            root = self._root / 'behavior-review'
+            workspace, scratch, home = root / 'target', root / 'scratch', root / 'home'
+            shutil.copytree(self._snapshot, workspace, symlinks=True)
+            scratch.mkdir()
+            home.mkdir()
+            self._prepare_build_config(workspace)
+            self._artifact_sources.append((scratch, pathlib.PurePosixPath('behavior-review')))
+            self._review_container = self._new_container(workspace, scratch, home, read_only=True)
+        return self._run(self._review_container, command, timeout_seconds)
+
+    def verify_candidate(
+        self, *, files: list[dict[str, Any]], identity_hash: str, behavior_review: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Reproduce the crash, preserve original contracts, then verify the candidate."""
+        from .behavior import (
+            VERIFICATION_VERSION, candidate_digest, preservation_test_name, validate_review_binding,
+        )
+        self._stop_owned_containers()
         checks: list[dict[str, Any]] = []
         deadline = time.monotonic() + 1800
         verifier: str | None = None
+        digest: str | None = None
+
+        def result(passed: bool, reason: str, *, retryable: bool = False) -> dict[str, Any]:
+            return {'version': VERIFICATION_VERSION, 'passed': passed, 'retryable': retryable,
+                    'candidateDigest': digest, 'reason': reason,
+                    'behaviorReview': behavior_review, 'checks': checks}
+
         try:
-            test_name = regression_test_name(identity_hash)
+            validate_review_binding(files, behavior_review)
+            digest = candidate_digest(files)
+            crash_name = regression_test_name(identity_hash)
+            preservation_name = preservation_test_name(identity_hash)
             tests: list[dict[str, Any]] = []
             sources: list[tuple[pathlib.PurePosixPath, str]] = []
             for item in files:
@@ -360,203 +392,138 @@ class InvestigationSandbox:
                 rel = pathlib.PurePosixPath(item['path'])
                 if rel.is_absolute() or not rel.parts or any(part in ('..', '.') for part in rel.parts) or '\\' in item['path']:
                     raise ValueError('candidate path escapes verification workspace')
-                if rel.parts[-1] == test_name and 'src' in rel.parts:
+                if rel.parts[-1] in (crash_name, preservation_name) and 'src' in rel.parts:
                     source_index = rel.parts.index('src')
                     if (source_index + 2 >= len(rel.parts) or
                             rel.parts[source_index + 1] not in ('test', 'androidTest') or
-                            rel.parts[source_index + 2] not in ('java', 'kotlin') or
-                            pathlib.PurePosixPath(rel.parts[-1]).suffix != '.kt'):
-                        raise ValueError('regression test must be a Kotlin file under src/test or src/androidTest')
+                            rel.parts[source_index + 2] not in ('java', 'kotlin')):
+                        raise ValueError('verification test must be Kotlin under src/test or src/androidTest')
                     module = pathlib.PurePosixPath(*rel.parts[:source_index])
                     if not module.parts:
-                        raise ValueError('regression test must belong to a module')
+                        raise ValueError('verification test must belong to a module')
                     tests.append({
                         'path': rel, 'content': item['content'],
                         'kind': rel.parts[source_index + 1], 'module': module,
                         'class': _test_class_name(rel, item['content']),
+                        'purpose': 'crash' if rel.name == crash_name else 'preservation',
                     })
                 elif rel.parts[-1].endswith(('.kt', '.java')) and 'src' in rel.parts:
                     source_index = rel.parts.index('src')
-                    if (source_index + 2 >= len(rel.parts) or
-                            rel.parts[source_index + 1] != 'main' or
-                            rel.parts[source_index + 2] not in ('java', 'kotlin')):
+                    if (source_index + 2 >= len(rel.parts) or rel.parts[source_index + 1] != 'main'
+                            or rel.parts[source_index + 2] not in ('java', 'kotlin')):
                         raise ValueError('source fix must be under src/main/java or src/main/kotlin')
                     sources.append((rel, item['content']))
                 else:
                     raise ValueError(f"unsupported verification file: {item['path']}")
-            if not tests:
-                raise ValueError('candidate must contain at least one generated regression test')
+            crash_tests = [test for test in tests if test['purpose'] == 'crash']
+            preservation_tests = [test for test in tests if test['purpose'] == 'preservation']
+            if not crash_tests or not preservation_tests:
+                raise ValueError('candidate needs separate crash and preservation test classes')
+            required_methods: dict[str, set[str]] = {}
+            for contract in behavior_review['contracts']:
+                required_methods.setdefault(contract['testPath'], set()).add(contract['testMethod'])
 
             run_id = uuid.uuid4().hex
             run_artifacts = self._artifacts / run_id
             run_artifacts.mkdir()
-            workspace, scratch, verify_home = self._verification_workspace(run_id, 'baseline', tests, [])
-            verifier = self._new_container(workspace, scratch, verify_home)
-
-            unit_tests: dict[pathlib.PurePosixPath, list[dict[str, Any]]] = {}
-            for test in tests:
-                if test['kind'] == 'test':
-                    unit_tests.setdefault(test['module'], []).append(test)
             unit_tasks: dict[pathlib.PurePosixPath, str] = {}
-            for module in unit_tests:
-                remaining = _remaining_timeout(deadline, 300)
-                if not remaining:
-                    return {'passed': False, 'retryable': True,
-                            'reason': 'verification time budget exhausted during task discovery', 'checks': checks}
-                module_task = ':'.join(module.parts)
-                listing = self._run(verifier, f'./gradlew --no-daemon :{module_task}:tasks --all', remaining)
-                task = _unit_test_task(listing['stdout'], module_task)
-                if task is None or listing['exit_code'] != 0 or listing['timed_out']:
-                    retryable = (
-                        listing['timed_out'] or listing['exit_code'] == 124
-                        or _container_liveness_failure(listing)
-                    )
-                    checks.append({'phase': 'task-discovery', 'module': module.as_posix(),
-                                   'exit_code': listing['exit_code'], 'timed_out': listing['timed_out']})
-                    return {'passed': False, 'retryable': retryable,
-                            'reason': 'trusted base build exposes no usable unit-test task', 'checks': checks}
-                unit_tasks[module] = task
-
-            baseline_unit: dict[pathlib.PurePosixPath, dict[str, Any]] = {}
-            for index, test in enumerate(tests):
-                module = test['module']
-                instrumented = test['kind'] == 'androidTest'
-                if not instrumented and module in baseline_unit:
-                    baseline = baseline_unit[module]
-                else:
-                    remaining = _remaining_timeout(deadline, 900)
+            stages = (
+                ('baseline-crash', crash_tests, []),
+                ('baseline-preservation', preservation_tests, []),
+                ('candidate', tests, sources),
+            )
+            for stage, stage_tests, stage_sources in stages:
+                workspace, scratch, verify_home = self._verification_workspace(
+                    run_id, stage, stage_tests, stage_sources,
+                )
+                verifier = self._new_container(workspace, scratch, verify_home)
+                for test in stage_tests:
+                    module = test['module']
+                    if test['kind'] != 'test' or module in unit_tasks:
+                        continue
+                    remaining = _remaining_timeout(deadline, 300)
                     if not remaining:
-                        return {'passed': False, 'retryable': True,
-                                'reason': 'verification time budget exhausted before baseline', 'checks': checks}
-                    if instrumented:
-                        module_task = ':'.join(module.parts)
-                        task = f':{module_task}:connectedDebugAndroidTest'
-                        log_name = f'baseline-{index}.logcat.txt'
-                        command = _instrumentation_command(task, test['class'], log_name)
+                        return result(False, 'verification time budget exhausted during task discovery', retryable=True)
+                    module_task = ':'.join(module.parts)
+                    listing = self._run(verifier, f'./gradlew --no-daemon :{module_task}:tasks --all', remaining)
+                    task = _unit_test_task(listing['stdout'], module_task)
+                    if task is None or listing['exit_code'] != 0 or listing['timed_out']:
+                        checks.append({'phase': 'task-discovery', 'module': module.as_posix(),
+                                       'exit_code': listing['exit_code'], 'timed_out': listing['timed_out']})
+                        return result(False, 'trusted base build exposes no usable unit-test task',
+                                      retryable=listing['timed_out'] or listing['exit_code'] == 124
+                                      or _container_liveness_failure(listing))
+                    unit_tasks[module] = task
+                unit_results: dict[pathlib.PurePosixPath, dict[str, Any]] = {}
+                for index, test in enumerate(stage_tests):
+                    module = test['module']
+                    instrumented = test['kind'] == 'androidTest'
+                    task = (':'.join(module.parts) + ':connectedDebugAndroidTest'
+                            if instrumented else unit_tasks[module])
+                    log_name = f'{stage}-{index}.logcat.txt'
+                    if not instrumented and module in unit_results:
+                        executed = unit_results[module]
                     else:
-                        task = unit_tasks[module]
-                        log_name = ''
-                        command = f'./gradlew --no-daemon --stacktrace {task}'
-                    if verifier is None:
-                        verifier = self._new_container(workspace, scratch, verify_home)
-                    baseline = self._run(verifier, command, remaining)
+                        remaining = _remaining_timeout(deadline, 900)
+                        if not remaining:
+                            return result(False, f'verification time budget exhausted during {stage}', retryable=True)
+                        command = (_instrumentation_command(task, test['class'], log_name) if instrumented
+                                   else f'./gradlew --no-daemon --stacktrace {task}')
+                        if verifier is None:
+                            verifier = self._new_container(workspace, scratch, verify_home)
+                        executed = self._run(verifier, command, remaining)
+                        self._stop_container(verifier)
+                        verifier = None
+                        if not instrumented:
+                            unit_results[module] = executed
+                    phase = 'candidate' if stage == 'candidate' else 'baseline'
+                    check = {
+                        'phase': phase, 'purpose': test['purpose'], 'path': test['path'].as_posix(),
+                        'exit_code': executed['exit_code'], 'timed_out': executed['timed_out'],
+                        'test_result': 'missing-failed-or-skipped', 'evidence': None, 'methods': [],
+                    }
+                    checks.append(check)
+                    if instrumented and _instrumentation_setup_failure(executed):
+                        check['test_result'] = 'setup-failure'
+                        _save_verification_artifacts(run_artifacts, f'{stage}-{index}', executed, None, workspace)
+                        return result(False, 'trusted Android instrumentation setup failed', retryable=True)
+                    if executed['timed_out'] or _container_liveness_failure(executed):
+                        check['test_result'] = 'timeout' if executed['timed_out'] else 'setup-failure'
+                        return result(False, f'trusted verification interrupted during {stage}', retryable=True)
+                    xml_path = _matching_xml(workspace, module, test['kind'], task, test['class'])
+                    _save_verification_artifacts(run_artifacts, f'{stage}-{index}', executed, xml_path, workspace)
+                    failed = xml_path is not None and _has_failure(xml_path, test['class'], workspace)
+                    passed = (executed['exit_code'] == 0 and xml_path is not None
+                              and _all_passed(xml_path, test['class'], workspace))
+                    methods = _passed_methods(xml_path, test['class'], workspace) if xml_path is not None else []
+                    check['methods'] = methods
+                    if test['purpose'] == 'preservation':
+                        passed = passed and required_methods[test['path'].as_posix()].issubset(methods)
+                    oom = _fatal_oom_proof(
+                        workspace, module, test['class'], scratch / log_name,
+                        executed['stdout'] + '\n' + executed['stderr'],
+                    ) if instrumented else None
+                    reproduced = executed['exit_code'] not in (None, 0) and (failed or oom is not None)
+                    check['test_result'] = ('passed' if passed else 'failed' if failed
+                                            else 'fatal-oom' if oom else 'missing-failed-or-skipped')
+                    check['evidence'] = (oom if oom else {'source': 'junit-xml'} if passed or failed else None)
+                    if not passed and xml_path is not None:
+                        check['failure'] = _failure_detail(xml_path, test['class'], workspace)
+                    if stage == 'baseline-crash':
+                        if not reproduced:
+                            return result(False, 'baseline did not reproduce the crash regression in JUnit XML or trusted Android OOM logs')
+                    elif not passed:
+                        return result(False, f'{stage} did not pass every existing behavior or reproduced regression')
+                if verifier is not None:
                     self._stop_container(verifier)
                     verifier = None
-                    if instrumented and _instrumentation_setup_failure(baseline):
-                        _save_verification_artifacts(run_artifacts, f'baseline-{index}', baseline, None, workspace)
-                        checks.append({
-                            'phase': 'baseline', 'path': test['path'].as_posix(),
-                            'exit_code': baseline['exit_code'], 'timed_out': baseline['timed_out'],
-                            'test_result': 'setup-failure', 'evidence': None,
-                        })
-                        return {'passed': False, 'retryable': True,
-                                'reason': 'trusted Android instrumentation setup failed', 'checks': checks}
-                    if baseline['timed_out']:
-                        checks.append({'phase': 'baseline', 'path': test['path'].as_posix(),
-                                       'exit_code': baseline['exit_code'], 'timed_out': True,
-                                       'test_result': 'timeout', 'evidence': None})
-                        return {'passed': False, 'retryable': True,
-                                'reason': 'trusted verification command timed out during baseline', 'checks': checks}
-                    if _container_liveness_failure(baseline):
-                        return {'passed': False, 'retryable': True,
-                                'reason': 'verification container became unavailable during baseline', 'checks': checks}
-                    if not instrumented:
-                        baseline_unit[module] = baseline
-                task = (':'.join(module.parts) + ':connectedDebugAndroidTest'
-                        if instrumented else unit_tasks[module])
-                xml_path = _matching_xml(workspace, module, test['kind'], task, test['class'])
-                _save_verification_artifacts(run_artifacts, f'baseline-{index}', baseline, xml_path, workspace)
-                xml_failure = xml_path is not None and _has_failure(xml_path, test['class'], workspace)
-                oom = _fatal_oom_proof(
-                    workspace, module, test['class'], scratch / f'baseline-{index}.logcat.txt',
-                    baseline['stdout'] + '\n' + baseline['stderr'],
-                ) if instrumented and not baseline['timed_out'] else None
-                reproduced = baseline['exit_code'] != 0 and not baseline['timed_out'] and (xml_failure or oom is not None)
-                checks.append({
-                    'phase': 'baseline', 'path': test['path'].as_posix(),
-                    'exit_code': baseline['exit_code'], 'timed_out': baseline['timed_out'],
-                    'test_result': 'failed' if xml_failure else 'fatal-oom' if oom else 'missing-or-not-failing',
-                    'evidence': oom if oom else {'source': 'junit-xml'} if xml_failure else None,
-                })
-                if not reproduced:
-                    return {'passed': False, 'retryable': False,
-                            'reason': 'baseline did not reproduce the regression in JUnit XML or trusted Android OOM logs',
-                            'checks': checks}
-
-            workspace, scratch, verify_home = self._verification_workspace(run_id, 'candidate', tests, sources)
-
-            candidate_unit: dict[pathlib.PurePosixPath, dict[str, Any]] = {}
-            all_passed = True
-            for index, test in enumerate(tests):
-                module = test['module']
-                instrumented = test['kind'] == 'androidTest'
-                if not instrumented and module in candidate_unit:
-                    after = candidate_unit[module]
-                else:
-                    remaining = _remaining_timeout(deadline, 900)
-                    if not remaining:
-                        return {'passed': False, 'retryable': True,
-                                'reason': 'verification time budget exhausted before candidate run', 'checks': checks}
-                    if instrumented:
-                        module_task = ':'.join(module.parts)
-                        task = f':{module_task}:connectedDebugAndroidTest'
-                        log_name = f'candidate-{index}.logcat.txt'
-                        command = _instrumentation_command(task, test['class'], log_name)
-                    else:
-                        task = unit_tasks[module]
-                        log_name = ''
-                        command = f'./gradlew --no-daemon --stacktrace {task}'
-                    if verifier is None:
-                        verifier = self._new_container(workspace, scratch, verify_home)
-                    after = self._run(verifier, command, remaining)
-                    self._stop_container(verifier)
-                    verifier = None
-                    if instrumented and _instrumentation_setup_failure(after):
-                        _save_verification_artifacts(run_artifacts, f'candidate-{index}', after, None, workspace)
-                        checks.append({
-                            'phase': 'candidate', 'path': test['path'].as_posix(),
-                            'exit_code': after['exit_code'], 'timed_out': after['timed_out'],
-                            'test_result': 'setup-failure', 'evidence': None,
-                        })
-                        return {'passed': False, 'retryable': True,
-                                'reason': 'trusted Android instrumentation setup failed', 'checks': checks}
-                    if after['timed_out']:
-                        checks.append({'phase': 'candidate', 'path': test['path'].as_posix(),
-                                       'exit_code': after['exit_code'], 'timed_out': True,
-                                       'test_result': 'timeout', 'evidence': None})
-                        return {'passed': False, 'retryable': True,
-                                'reason': 'trusted verification command timed out during candidate run', 'checks': checks}
-                    if _container_liveness_failure(after):
-                        return {'passed': False, 'retryable': True,
-                                'reason': 'verification container became unavailable during candidate run', 'checks': checks}
-                    if not instrumented:
-                        candidate_unit[module] = after
-                task = (':'.join(module.parts) + ':connectedDebugAndroidTest'
-                        if instrumented else unit_tasks[module])
-                xml_path = _matching_xml(workspace, module, test['kind'], task, test['class'])
-                _save_verification_artifacts(run_artifacts, f'candidate-{index}', after, xml_path, workspace)
-                passed = (after['exit_code'] == 0 and not after['timed_out'] and
-                          xml_path is not None and _all_passed(xml_path, test['class'], workspace))
-                oom = _fatal_oom_proof(
-                    workspace, module, test['class'], scratch / f'candidate-{index}.logcat.txt',
-                    after['stdout'] + '\n' + after['stderr'],
-                ) if instrumented and not after['timed_out'] else None
-                checks.append({
-                    'phase': 'candidate', 'path': test['path'].as_posix(),
-                    'exit_code': after['exit_code'], 'timed_out': after['timed_out'],
-                    'test_result': 'passed' if passed else 'fatal-oom' if oom else 'missing-failed-or-skipped',
-                    'evidence': {'source': 'junit-xml'} if passed else oom,
-                })
-                all_passed = all_passed and passed
-            return {'passed': all_passed, 'retryable': False,
-                    'reason': 'all regressions reproduced and passed with candidate' if all_passed else 'candidate did not pass every reproduced regression',
-                    'checks': checks}
+            return result(True, 'crash reproduced and fixed; original behavior contracts passed unchanged')
         except RuntimeError as exc:
             if str(exc).startswith(('could not start investigation container:', 'could not stop owned investigation container:')):
-                return {'passed': False, 'retryable': True, 'reason': str(exc)[:300], 'checks': checks}
+                return result(False, str(exc)[:300], retryable=True)
             raise
         except (OSError, ValueError, TypeError, ET.ParseError) as exc:
-            return {'passed': False, 'retryable': False, 'reason': str(exc)[:300], 'checks': checks}
+            return result(False, str(exc)[:300])
         finally:
             if verifier is not None:
                 self._stop_container(verifier)
@@ -825,3 +792,39 @@ def _all_passed(path: pathlib.Path, test_class: str, workspace: pathlib.Path) ->
         'skipped' not in node.attrib and node.find('skipped') is None
         for node in matched
     )
+
+
+def _passed_methods(path: pathlib.Path, test_class: str, workspace: pathlib.Path) -> list[str]:
+    data = _read_regular_file(workspace, path, 5 * 1024 * 1024)
+    if data is None:
+        return []
+    try:
+        root = ET.fromstring(data)
+    except ET.ParseError:
+        return []
+    return [
+        node.attrib['name'] for node in root.iter('testcase')
+        if _matches_testcase(node, test_class) and node.attrib.get('name')
+        and node.find('failure') is None and node.find('error') is None
+        and node.find('skipped') is None and 'skipped' not in node.attrib
+    ]
+
+
+def _failure_detail(path: pathlib.Path, test_class: str, workspace: pathlib.Path) -> str:
+    data = _read_regular_file(workspace, path, 5 * 1024 * 1024)
+    if data is None:
+        return ''
+    try:
+        root = ET.fromstring(data)
+    except ET.ParseError:
+        return ''
+    for node in root.iter('testcase'):
+        if not _matches_testcase(node, test_class):
+            continue
+        failure = node.find('failure')
+        if failure is None:
+            failure = node.find('error')
+        if failure is not None:
+            return (node.attrib.get('name', '') + ': ' + failure.attrib.get('message', '')
+                    + ' ' + (failure.text or ''))[:2000]
+    return ''

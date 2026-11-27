@@ -268,6 +268,33 @@ def test_manual_hold_redelivery_does_not_dispatch_or_change_job_counters():
     assert after["status"] == before["status"] == "manual"
     assert after["attempts"] == before["attempts"]
     assert after["deliveryAttempts"] == before["deliveryAttempts"]
+def test_pre_policy_published_investigation_is_held_without_service_mutations():
+    github = MemoryGitHub()
+    alert = service_context_alert()
+    job = new_job(alert, {'status': 'ready'}, 17)
+    job.pop('verificationPolicy', None)
+    job['branches'] = {'production': {
+        'pullNumber': 1789, 'headSha': 'e' * 40, 'baseSha': 'a' * 40,
+        'manifestDigest': 'b' * 64, 'baseBranch': 'production',
+    }}
+    job['status'] = 'queued'
+    queue = InvestigationQueue(github)
+    queue.put(job)
+    before = (github.patch_count, len(github.blobs), len(github.trees), len(github.commits),
+              copy.deepcopy(github.refs), copy.deepcopy(github.comments))
+    dispatches = []
+    service = CrashAutomation(
+        github, CONFIG, bigquery_client=MemoryBigQuery(),
+        worker_dispatch=lambda: dispatches.append(None),
+    )
+
+    result = service.process_fix_task({'alert': ALERT})
+
+    after = (github.patch_count, len(github.blobs), len(github.trees), len(github.commits),
+             copy.deepcopy(github.refs), copy.deepcopy(github.comments))
+    assert result == {'outcome': 'held-existing', 'issueNumber': 17}
+    assert after == before
+    assert dispatches == []
 
 
 def test_obsolete_verification_resume_key_is_discarded_on_job_write():
@@ -406,6 +433,7 @@ def test_unbounded_or_malformed_attempt_grants_cannot_be_saved(limits):
 
 
 def _proposal_fixture(queue, job=None):
+    from crashlytics_automation.behavior import preservation_test_name, source_digest
     from crashlytics_automation.candidate import identity_hash_for, regression_test_name
     from crashlytics_automation.investigation_jobs import new_job
 
@@ -417,18 +445,39 @@ def _proposal_fixture(queue, job=None):
     source_path = 'domain/src/main/kotlin/org/koin/Thing.kt'
     source_content = 'package org.koin\nclass Thing { fun value() = 2 }\n'
     test_path = f'domain/src/test/kotlin/org/koin/{regression_test_name(identity)}'
-    test_content = 'package org.koin\nclass RegressionTest\n'
+    preservation_path = f'domain/src/test/kotlin/org/koin/{preservation_test_name(identity)}'
+    test_content = (
+        f'package org.koin\nclass {regression_test_name(identity)[:-3]} {{\n'
+        '  @org.junit.Test fun regressionReproduced() {}\n}\n'
+    )
+    preservation_content = (
+        f'package org.koin\nclass {preservation_test_name(identity)[:-3]} {{\n'
+        '  @org.junit.Test fun existingBehaviorRemainsUnchanged() {}\n}\n'
+    )
     import hashlib
     files = [
         {'path': source_path, 'kind': 'source', 'beforeSha256': 'c' * 64,
          'afterSha256': hashlib.sha256(source_content.encode()).hexdigest(), 'content': source_content},
         {'path': test_path, 'kind': 'test', 'beforeSha256': None,
          'afterSha256': hashlib.sha256(test_content.encode()).hexdigest(), 'content': test_content},
+        {'path': preservation_path, 'kind': 'test', 'beforeSha256': None,
+         'afterSha256': hashlib.sha256(preservation_content.encode()).hexdigest(),
+         'content': preservation_content},
     ]
     decision = {
         'decision': 'fix', 'analysis': 'Root cause found in Thing.value.',
         'reason': 'The source change addresses the crash.', 'sourcePath': source_path,
         'sourceLine': 2, 'files': files,
+        'behaviorReview': {
+            'version': 1, 'approved': True, 'reason': 'Existing behavior remains unchanged.',
+            'unrelatedChanges': [],
+            'contracts': [{
+                'sourcePath': source_path, 'sourceLine': 2,
+                'behavior': 'Existing behavior remains unchanged.',
+                'testPath': preservation_path, 'testMethod': 'existingBehaviorRemainsUnchanged',
+            }],
+            'sourceDigest': source_digest(files),
+        },
     }
     return job, decision
 
@@ -443,7 +492,7 @@ def test_proposal_checkpoint_is_versioned_reachable_and_excludes_tool_results():
         release_sha=job['releaseSha'], branch_base_sha='b' * 40, base_sha='d' * 40,
     )
     restored = queue.get_proposal(queue.get(service_context_alert()), 'production')
-    assert envelope['version'] == 1
+    assert envelope['version'] == 2
     assert envelope['identity'] == {
         'jobId': job['id'], 'target': 'production', 'releaseSha': 'a' * 40,
         'branchBaseSha': 'b' * 40, 'baseSha': 'd' * 40,
@@ -526,15 +575,43 @@ def test_serial_state_writes_survive_stale_ref_reads_without_losing_updates():
 
 
 def _publication_fixture(base_sha='d' * 40):
+    from crashlytics_automation.behavior import candidate_digest
     from crashlytics_automation.candidate import candidate_manifest, identity_hash_for
     job, decision = _proposal_fixture(None)
+    identity = identity_hash_for(service_context_alert().issue_id, job['releaseSha'])
+    crash_path = next(
+        item['path'] for item in decision['files']
+        if 'CrashlyticsRegression' in item['path']
+    )
+    preservation_path = decision['behaviorReview']['contracts'][0]['testPath']
+    files = [
+        {key: item[key] for key in ('path', 'kind', 'beforeSha256', 'afterSha256')}
+        for item in decision['files']
+    ]
+    proof = {
+        'version': 2, 'passed': True, 'reason': 'Crash reproduced and behavior preserved.',
+        'candidateDigest': candidate_digest(files),
+        'behaviorReview': decision['behaviorReview'],
+        'checks': [
+            {'phase': 'baseline', 'purpose': 'crash', 'path': crash_path, 'exit_code': 1,
+             'timed_out': False, 'test_result': 'failed', 'evidence': {'source': 'junit-xml'},
+             'methods': []},
+            {'phase': 'candidate', 'purpose': 'crash', 'path': crash_path, 'exit_code': 0,
+             'timed_out': False, 'test_result': 'passed', 'evidence': {'source': 'junit-xml'},
+             'methods': ['regressionReproduced']},
+            *[
+                {'phase': phase, 'purpose': 'preservation', 'path': preservation_path, 'exit_code': 0,
+                 'timed_out': False, 'test_result': 'passed', 'evidence': {'source': 'junit-xml'},
+                 'methods': ['existingBehaviorRemainsUnchanged']}
+                for phase in ('baseline', 'candidate')
+            ],
+        ],
+    }
     return candidate_manifest(
         issue_id=service_context_alert().issue_id, issue_number=job['issueNumber'],
-        identity_hash=identity_hash_for(service_context_alert().issue_id, job['releaseSha']),
+        identity_hash=identity,
         base_sha=base_sha, branch_base_sha='b' * 40, source_sha=job['releaseSha'],
-        source_path=decision['sourcePath'],
-        files=[{key: item[key] for key in ('path', 'kind', 'beforeSha256', 'afterSha256')}
-               for item in decision['files']],
+        source_path=decision['sourcePath'], files=files, verification=proof,
     )
 
 

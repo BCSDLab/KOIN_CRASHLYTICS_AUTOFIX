@@ -12,17 +12,50 @@ IDENTITY = identity_hash_for('ownership-issue', RELEASE)
 
 
 def _manifest():
+    from crashlytics_automation.behavior import candidate_digest, source_digest
+
+    regression = f'domain/src/test/kotlin/org/koin/{regression_test_name(IDENTITY)}'
+    preservation = (
+        f'domain/src/test/kotlin/org/koin/CrashlyticsPreservation{IDENTITY[:12]}Test.kt'
+    )
+    files = [
+        {'path': SOURCE_PATH, 'kind': 'source', 'beforeSha256': 'd' * 64, 'afterSha256': 'e' * 64},
+        {'path': regression, 'kind': 'test', 'beforeSha256': None, 'afterSha256': 'f' * 64},
+        {'path': preservation, 'kind': 'test', 'beforeSha256': None, 'afterSha256': '1' * 64},
+    ]
+    proof = {
+        'version': 2, 'passed': True, 'reason': 'Both regression and preservation checks passed.',
+        'candidateDigest': candidate_digest(files),
+        'behaviorReview': {
+            'version': 1, 'approved': True, 'reason': 'No unrelated behavior changes.',
+            'unrelatedChanges': [],
+            'contracts': [{
+                'sourcePath': SOURCE_PATH, 'sourceLine': 1,
+                'behavior': 'Existing behavior remains unchanged.',
+                'testPath': preservation, 'testMethod': 'existingBehaviorRemainsUnchanged',
+            }],
+            'sourceDigest': source_digest(files),
+        },
+        'checks': [
+            {'phase': 'baseline', 'purpose': 'crash', 'path': regression,
+             'exit_code': 1, 'timed_out': False, 'test_result': 'failed',
+             'evidence': {'source': 'junit-xml'}, 'methods': []},
+            {'phase': 'candidate', 'purpose': 'crash', 'path': regression,
+             'exit_code': 0, 'timed_out': False, 'test_result': 'passed',
+             'evidence': {'source': 'junit-xml'}, 'methods': ['regressionReproduced']},
+            *[
+                {'phase': phase, 'purpose': 'preservation', 'path': preservation,
+                 'exit_code': 0, 'timed_out': False, 'test_result': 'passed',
+                 'evidence': {'source': 'junit-xml'}, 'methods': ['existingBehaviorRemainsUnchanged']}
+                for phase in ('baseline', 'candidate')
+            ],
+        ],
+    }
     return candidate_manifest(
         issue_id='ownership-issue', issue_number=17, identity_hash=IDENTITY,
         base_sha=RELEASE, branch_base_sha=RELEASE, source_sha=RELEASE,
-        source_path=SOURCE_PATH,
-        files=[
-            {'path': SOURCE_PATH, 'kind': 'source', 'beforeSha256': 'd' * 64, 'afterSha256': 'e' * 64},
-            {'path': f'domain/src/test/kotlin/org/koin/{regression_test_name(IDENTITY)}',
-             'kind': 'test', 'beforeSha256': None, 'afterSha256': 'f' * 64},
-        ],
+        source_path=SOURCE_PATH, files=files, verification=proof,
     )
-
 
 def _pull(base='production'):
     from crashlytics_automation.candidate import branch_name_for

@@ -158,12 +158,20 @@ def publish_investigated_fix(
     validated = validate_candidate(files, baseline_map, identity_hash)
     if not validated['valid']:
         return _review(validated['reason'])
+    from .behavior import validate_verified_checks
+    try:
+        validate_verified_checks(validated['files'], verification)
+    except (ValueError, TypeError) as error:
+        return _review(f'기존 동작 보존 검증이 완료되지 않았습니다: {error}')
+    if decision.get('behaviorReview') != verification.get('behaviorReview'):
+        return _review('수정안과 독립 기능 보존 검토가 일치하지 않습니다.')
     manifest = candidate_manifest(
         issue_id=alert.issue_id, issue_number=issue_number, identity_hash=identity_hash,
         base_sha=base_sha, branch_base_sha=branch_base_sha, source_sha=release_sha,
         source_path=source.path,
         files=[{key: file[key] for key in ('path', 'kind', 'beforeSha256', 'afterSha256')}
                for file in validated['files']],
+        verification=dict(verification),
     )
     plan = FixPlan(
         manifest=manifest,

@@ -177,12 +177,12 @@ def _manifest_lists_crashed_file(
     shared = SHARED_FIX_BRANCH.fullmatch(head_ref)
     historical_current = _ISSUE_FIX_BRANCH.fullmatch(head_ref)
     if shared is not None:
-        if manifest.get("version") != 3 or int(shared.group('issueNumber')) != manifest.get("issueNumber"):
+        if manifest.get("version") not in (3, 4) or int(shared.group('issueNumber')) != manifest.get("issueNumber"):
             return False
     elif historical_current is not None:
-        if manifest.get("version") != 3 or int(historical_current.group(1)) != manifest.get("issueNumber"):
+        if manifest.get("version") not in (3, 4) or int(historical_current.group(1)) != manifest.get("issueNumber"):
             return False
-    elif manifest.get("version") == 3:
+    elif manifest.get("version") in (3, 4):
         return False
     files = manifest.get("files")
     return isinstance(files, list) and any(

@@ -40,8 +40,8 @@ RELEASE_SHA = 'b' * 40
 OTHER_RELEASE_SHA = 'c' * 40
 DEVELOP_SHA = 'f' * 40
 SOURCE_PATH = 'domain/src/main/java/org/koin/Thing.java'
-SOURCE_BASE = 'package org.koin;\nclass Thing { int value() { return 1; } }\n'
-SOURCE_AFTER = 'package org.koin;\nclass Thing { int value() { return 2; } }\n'
+SOURCE_BASE = 'package org.koin;\nclass Thing { int value() { return 1; } int stableValue() { return 7; } }\n'
+SOURCE_AFTER = 'package org.koin;\nclass Thing { int value() { return 2; } int stableValue() { return 7; } }\n'
 IDENTITY_HASH = identity_hash_for(ALERT.issue_id, RELEASE_SHA)
 TEST_CLASS = regression_test_name(IDENTITY_HASH).removesuffix('.kt')
 TEST_PATH = f'domain/src/androidTest/java/org/koin/{TEST_CLASS}.java'
@@ -56,6 +56,19 @@ public class {TEST_CLASS} {{
     }}
 }}
 '''
+PRESERVATION_PATH = (
+    f'domain/src/androidTest/java/org/koin/CrashlyticsPreservation{IDENTITY_HASH[:12]}Test.kt'
+)
+PRESERVATION_CLASS = PRESERVATION_PATH.rsplit('/', 1)[1].removesuffix('.kt')
+PRESERVATION_CONTENT = f'''package org.koin
+import org.junit.Test
+import org.junit.Assert.assertEquals
+class {PRESERVATION_CLASS} {{
+    @Test fun originalValueIsPreserved() {{
+        assertEquals(7, Thing().stableValue())
+    }}
+}}
+'''
 DECISION = {
     'decision': 'fix',
     'sourcePath': SOURCE_PATH,
@@ -63,8 +76,104 @@ DECISION = {
     'files': [
         {'path': SOURCE_PATH, 'content': SOURCE_AFTER},
         {'path': TEST_PATH, 'content': TEST_CONTENT},
+        {'path': PRESERVATION_PATH, 'content': PRESERVATION_CONTENT},
     ],
 }
+
+
+def _valid_proof(files, preservation_content=PRESERVATION_CONTENT):
+    from crashlytics_automation.behavior import candidate_digest, source_digest
+    entries = []
+    for item in files:
+        path = item['path']
+        if path.endswith(('.kt', '.java')) and '/src/main/' in path:
+            entries.append({
+                'path': path, 'kind': 'source',
+                'beforeSha256': hashlib.sha256(SOURCE_BASE.encode()).hexdigest(),
+                'afterSha256': hashlib.sha256(item['content'].encode()).hexdigest(),
+            })
+        else:
+            entries.append({
+                'path': path, 'kind': 'test', 'beforeSha256': None,
+                'afterSha256': hashlib.sha256(item['content'].encode()).hexdigest(),
+            })
+    preservation_path = next(item['path'] for item in entries if 'CrashlyticsPreservation' in item['path'])
+    crash_path = next(item['path'] for item in entries if 'CrashlyticsRegression' in item['path'])
+    source_path = next(item['path'] for item in entries if item['kind'] == 'source')
+    review = {
+        'version': 1, 'approved': True, 'reason': 'Original behavior is preserved.',
+        'unrelatedChanges': [],
+        'contracts': [{
+            'sourcePath': source_path, 'sourceLine': 2,
+            'behavior': 'The original value remains observable.',
+            'testPath': preservation_path, 'testMethod': 'originalValueIsPreserved',
+        }],
+        'sourceDigest': source_digest([entry for entry in entries if entry['kind'] == 'source']),
+    }
+
+    def check(phase, purpose, path, method):
+        passed = phase == 'candidate' or purpose == 'preservation'
+        return {
+            'phase': phase, 'purpose': purpose, 'path': path,
+            'exit_code': 0 if passed else 1, 'timed_out': False,
+            'test_result': 'passed' if passed else 'failed',
+            'evidence': {'source': 'junit-xml'},
+            'methods': [method] if passed else [],
+        }
+
+    return {
+        'version': 2, 'passed': True, 'reason': 'Crash fixed and behavior preserved.',
+        'candidateDigest': candidate_digest(entries),
+        'behaviorReview': review,
+        'checks': [
+            check('baseline', 'crash', crash_path, 'thingReturnsFixedValue'),
+            check('candidate', 'crash', crash_path, 'thingReturnsFixedValue'),
+            check('baseline', 'preservation', preservation_path, 'originalValueIsPreserved'),
+            check('candidate', 'preservation', preservation_path, 'originalValueIsPreserved'),
+        ],
+    }
+DECISION['behaviorReview'] = _valid_proof(DECISION['files'])['behaviorReview']
+
+def _manifest_fixture(identity):
+    regression_path = f'domain/src/test/java/org/koin/{regression_test_name(identity)}'
+    preservation_path = (
+        PRESERVATION_PATH if identity == IDENTITY_HASH
+        else f'domain/src/test/java/org/koin/CrashlyticsPreservation{identity[:12]}Test.kt'
+    )
+    if identity == IDENTITY_HASH:
+        preservation_content = PRESERVATION_CONTENT
+        test_content = TEST_CONTENT
+    else:
+        preservation_class = preservation_path.rsplit('/', 1)[1].removesuffix('.kt')
+        regression_class = regression_path.rsplit('/', 1)[1].removesuffix('.kt')
+        preservation_content = (
+            f'package org.koin\nclass {preservation_class} {{\n'
+            '  @org.junit.Test fun originalValueIsPreserved() {}\n}\n'
+        )
+        test_content = (
+            f'package org.koin\nclass {regression_class} {{\n'
+            '  @org.junit.Test fun thingReturnsFixedValue() {}\n}\n'
+        )
+    content = [
+        {'path': SOURCE_PATH, 'content': SOURCE_AFTER},
+        {'path': regression_path, 'content': test_content},
+        {'path': preservation_path, 'content': preservation_content},
+    ]
+    entries = []
+    for item in content:
+        if item['path'] == SOURCE_PATH:
+            entries.append({
+                'path': SOURCE_PATH, 'kind': 'source',
+                'beforeSha256': hashlib.sha256(SOURCE_BASE.encode()).hexdigest(),
+                'afterSha256': hashlib.sha256(SOURCE_AFTER.encode()).hexdigest(),
+            })
+        else:
+            entries.append({
+                'path': item['path'], 'kind': 'test', 'beforeSha256': None,
+                'afterSha256': hashlib.sha256(item['content'].encode()).hexdigest(),
+            })
+    proof = _valid_proof(content)
+    return entries, proof
 
 
 
@@ -116,7 +225,7 @@ def test_unknown_baseline_never_publishes(monkeypatch):
         object(), alert=ALERT, evidence={'status': 'ready'}, decision=DECISION,
         issue_number=1, base_branch='production', base_sha=BASE_SHA,
         branch_base_sha=BRANCH_BASE_SHA, release_sha=RELEASE_SHA,
-        bot_login='autofix[bot]', verification={'passed': True},
+        bot_login='autofix[bot]', verification=_valid_proof(DECISION['files']),
         publication_store=PublicationStore(),
     )
 
@@ -152,22 +261,25 @@ def test_java_instrumentation_test_publishes_release_scoped_manifest(monkeypatch
         object(), alert=ALERT, evidence={'status': 'ready'}, decision=DECISION,
         issue_number=1, base_branch='production', base_sha=BASE_SHA,
         branch_base_sha=BRANCH_BASE_SHA, release_sha=RELEASE_SHA,
-        bot_login='autofix[bot]', verification={'passed': True},
+        bot_login='autofix[bot]', verification=_valid_proof(DECISION['files']),
         publication_store=PublicationStore(),
     )
 
     plan = captured['plan']
     assert result is expected
     assert captured['bot_login'] == 'autofix[bot]'
-    assert plan.manifest['version'] == 3
+    assert plan.manifest['version'] == 4
     assert plan.manifest['issueNumber'] == 1
     assert plan.manifest['baseSha'] == BASE_SHA
     assert plan.manifest['branchBaseSha'] == BRANCH_BASE_SHA
     assert plan.branch_base_sha == BRANCH_BASE_SHA
     assert plan.manifest['identityHash'] == IDENTITY_HASH
-    assert {file['path'] for file in plan.manifest['files']} == {SOURCE_PATH, TEST_PATH}
+    assert {file['path'] for file in plan.manifest['files']} == {
+        SOURCE_PATH, TEST_PATH, PRESERVATION_PATH,
+    }
     assert {change.path: change.content for change in plan.changes} == {
         SOURCE_PATH: SOURCE_AFTER, TEST_PATH: TEST_CONTENT,
+        PRESERVATION_PATH: PRESERVATION_CONTENT,
     }
 
 
@@ -186,7 +298,7 @@ def test_changed_or_existing_test_baseline_is_rejected(monkeypatch):
         object(), alert=ALERT, evidence={'status': 'ready'}, decision=DECISION,
         issue_number=1, base_branch='production', base_sha=BASE_SHA,
         branch_base_sha=BRANCH_BASE_SHA, release_sha=RELEASE_SHA,
-        bot_login='autofix[bot]', verification={'passed': True},
+        bot_login='autofix[bot]', verification=_valid_proof(DECISION['files']),
         publication_store=PublicationStore(),
     )
 
@@ -209,25 +321,19 @@ def test_source_release_changes_branch_test_and_manifest_identity():
         f'domain/src/test/java/org/koin/{regression_test_name(first)}', second,
     )
 
+    first_files, first_proof = _manifest_fixture(first)
     first_manifest = candidate_manifest(
         issue_id=ALERT.issue_id, identity_hash=first, issue_number=1,
         base_sha=BASE_SHA, branch_base_sha=BRANCH_BASE_SHA,
         source_sha=RELEASE_SHA, source_path=SOURCE_PATH,
-        files=[
-            {'path': SOURCE_PATH, 'kind': 'source', 'beforeSha256': '1' * 64, 'afterSha256': '2' * 64},
-            {'path': f'domain/src/test/java/org/koin/{regression_test_name(first)}', 'kind': 'test',
-             'beforeSha256': None, 'afterSha256': '3' * 64},
-        ],
+        files=first_files, verification=first_proof,
     )
+    second_files, second_proof = _manifest_fixture(second)
     second_manifest = candidate_manifest(
         issue_id=ALERT.issue_id, identity_hash=second, issue_number=1,
         base_sha=BASE_SHA, branch_base_sha=BRANCH_BASE_SHA,
         source_sha=OTHER_RELEASE_SHA, source_path=SOURCE_PATH,
-        files=[
-            {'path': SOURCE_PATH, 'kind': 'source', 'beforeSha256': '1' * 64, 'afterSha256': '2' * 64},
-            {'path': f'domain/src/test/java/org/koin/{regression_test_name(second)}', 'kind': 'test',
-             'beforeSha256': None, 'afterSha256': '3' * 64},
-        ],
+        files=second_files, verification=second_proof,
     )
     assert first_manifest['identityHash'] != second_manifest['identityHash']
     assert validate_manifest(first_manifest)['valid']
@@ -275,26 +381,12 @@ def test_legacy_v1_manifest_remains_valid_for_historical_merge_and_ownership():
     assert not validate_manifest(legacy, {'identityHash': IDENTITY_HASH})['valid']
  
 def test_develop_publication_commits_production_tree_but_targets_develop():
+    manifest_files, verification = _manifest_fixture(IDENTITY_HASH)
     manifest = candidate_manifest(
-        issue_id=ALERT.issue_id,
-        identity_hash=IDENTITY_HASH,
-        issue_number=17,
-        base_sha=DEVELOP_SHA,
-        branch_base_sha=BRANCH_BASE_SHA,
-        source_sha=RELEASE_SHA,
-        source_path=SOURCE_PATH,
-        files=[
-            {
-                'path': SOURCE_PATH, 'kind': 'source',
-                'beforeSha256': hashlib.sha256(SOURCE_BASE.encode()).hexdigest(),
-                'afterSha256': hashlib.sha256(SOURCE_AFTER.encode()).hexdigest(),
-            },
-            {
-                'path': TEST_PATH, 'kind': 'test',
-                'beforeSha256': None,
-                'afterSha256': hashlib.sha256(TEST_CONTENT.encode()).hexdigest(),
-            },
-        ],
+        issue_id=ALERT.issue_id, identity_hash=IDENTITY_HASH, issue_number=17,
+        base_sha=DEVELOP_SHA, branch_base_sha=BRANCH_BASE_SHA,
+        source_sha=RELEASE_SHA, source_path=SOURCE_PATH,
+        files=manifest_files, verification=verification,
     )
     calls = []
 
@@ -322,7 +414,8 @@ def test_develop_publication_commits_production_tree_but_targets_develop():
 
     plan = FixPlan(
         manifest=manifest,
-        changes=(FileChange(SOURCE_PATH, SOURCE_AFTER), FileChange(TEST_PATH, TEST_CONTENT)),
+        changes=(FileChange(SOURCE_PATH, SOURCE_AFTER), FileChange(TEST_PATH, TEST_CONTENT),
+                 FileChange(PRESERVATION_PATH, PRESERVATION_CONTENT)),
         title='fix',
         issue_number=17,
         base_branch='develop',
@@ -337,7 +430,9 @@ def test_develop_publication_commits_production_tree_but_targets_develop():
     assert result.base_branch == 'develop'
     tree_call = next(call for call in calls if call[1].endswith('/git/trees'))
     assert tree_call[2]['base_tree'] == '1' * 40
-    assert {entry['path'] for entry in tree_call[2]['tree']} == {SOURCE_PATH, TEST_PATH}
+    assert {entry['path'] for entry in tree_call[2]['tree']} == {
+        SOURCE_PATH, TEST_PATH, PRESERVATION_PATH,
+    }
     commit_call = next(call for call in calls if call[1].endswith('/git/commits'))
     assert commit_call[2]['parents'] == [BRANCH_BASE_SHA]
     ref_call = next(call for call in calls if call[1].endswith('/git/refs'))
@@ -425,21 +520,32 @@ def test_shared_publication_reuses_one_head_for_both_targets_and_rejects_mismatc
              'afterSha256': hashlib.sha256(SOURCE_AFTER.encode()).hexdigest()},
             {'path': TEST_PATH, 'kind': 'test', 'beforeSha256': None,
              'afterSha256': hashlib.sha256(test_content.encode()).hexdigest()},
+            {'path': PRESERVATION_PATH, 'kind': 'test', 'beforeSha256': None,
+             'afterSha256': hashlib.sha256(PRESERVATION_CONTENT.encode()).hexdigest()},
+        ]
+        proof_files = [
+            {'path': SOURCE_PATH, 'content': SOURCE_AFTER},
+            {'path': TEST_PATH, 'content': test_content},
+            {'path': PRESERVATION_PATH, 'content': PRESERVATION_CONTENT},
         ]
         manifest = candidate_manifest(
             issue_id=ALERT.issue_id, identity_hash=IDENTITY_HASH, issue_number=17,
             base_sha=base_sha, branch_base_sha=BRANCH_BASE_SHA, source_sha=RELEASE_SHA,
-            source_path=SOURCE_PATH, files=files,
+            source_path=SOURCE_PATH, files=files, verification=_valid_proof(proof_files),
         )
         return FixPlan(
             manifest=manifest,
-            changes=(FileChange(SOURCE_PATH, SOURCE_AFTER), FileChange(TEST_PATH, test_content)),
+            changes=(FileChange(SOURCE_PATH, SOURCE_AFTER), FileChange(TEST_PATH, test_content),
+                     FileChange(PRESERVATION_PATH, PRESERVATION_CONTENT)),
             title='fix', issue_number=17, base_branch=base_branch,
             branch_base_sha=BRANCH_BASE_SHA,
         )
 
     github = Github()
-    github.files = {SOURCE_PATH: SOURCE_AFTER, TEST_PATH: TEST_CONTENT}
+    github.files = {
+        SOURCE_PATH: SOURCE_AFTER, TEST_PATH: TEST_CONTENT,
+        PRESERVATION_PATH: PRESERVATION_CONTENT,
+    }
     store = PublicationStore()
     production = publish_fix_pull_request(
         github, plan=make_plan(BASE_SHA, 'production'),
@@ -473,17 +579,12 @@ def test_shared_publication_reuses_one_head_for_both_targets_and_rejects_mismatc
     assert github.commit_posts == 1 and github.ref_posts == 1
 
 def test_metadata_persistence_failure_blocks_branch_and_pull_request():
+    manifest_files, verification = _manifest_fixture(IDENTITY_HASH)
     manifest = candidate_manifest(
         issue_id=ALERT.issue_id, identity_hash=IDENTITY_HASH, issue_number=17,
         base_sha=DEVELOP_SHA, branch_base_sha=BRANCH_BASE_SHA,
         source_sha=RELEASE_SHA, source_path=SOURCE_PATH,
-        files=[
-            {'path': SOURCE_PATH, 'kind': 'source',
-             'beforeSha256': hashlib.sha256(SOURCE_BASE.encode()).hexdigest(),
-             'afterSha256': hashlib.sha256(SOURCE_AFTER.encode()).hexdigest()},
-            {'path': TEST_PATH, 'kind': 'test', 'beforeSha256': None,
-             'afterSha256': hashlib.sha256(TEST_CONTENT.encode()).hexdigest()},
-        ],
+        files=manifest_files, verification=verification,
     )
     calls = []
 
@@ -507,7 +608,8 @@ def test_metadata_persistence_failure_blocks_branch_and_pull_request():
 
     plan = FixPlan(
         manifest=manifest,
-        changes=(FileChange(SOURCE_PATH, SOURCE_AFTER), FileChange(TEST_PATH, TEST_CONTENT)),
+        changes=(FileChange(SOURCE_PATH, SOURCE_AFTER), FileChange(TEST_PATH, TEST_CONTENT),
+                 FileChange(PRESERVATION_PATH, PRESERVATION_CONTENT)),
         title='fix', issue_number=17, base_branch='develop',
         branch_base_sha=BRANCH_BASE_SHA,
     )

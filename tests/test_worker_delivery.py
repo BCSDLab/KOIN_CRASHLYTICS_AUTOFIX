@@ -36,12 +36,13 @@ class Queue:
 
     def save_proposal(self, job, target, decision, *, release_sha, branch_base_sha, base_sha):
         envelope = {
-            'version': 1,
+            'version': 2,
             'identity': {'jobId': job['id'], 'target': target, 'releaseSha': release_sha,
                          'branchBaseSha': branch_base_sha, 'baseSha': base_sha},
             'proposal': {key: decision[key] for key in (
                 'decision', 'analysis', 'reason', 'sourcePath', 'sourceLine', 'files',
-            )},
+                'behaviorReview',
+            ) if key in decision},
         }
         self.proposals[target] = copy.deepcopy(envelope)
         job.setdefault('proposals', {})[target] = '1' * 40
@@ -194,22 +195,56 @@ def test_failed_trusted_verification_reports_analysis_without_publishing(monkeyp
 
     identity = identity_hash_for(ALERT.issue_id, RELEASE_SHA)
     test_path = f'domain/src/test/kotlin/org/koin/{regression_test_name(identity)}'
-    source_before = 'package org.koin\nclass Thing { fun value() = 1 }\n'
+    preservation_path = (
+        f'domain/src/test/kotlin/org/koin/CrashlyticsPreservation{identity[:12]}Test.kt'
+    )
+    source_before = (
+        'package org.koin\nclass FixedTicker { var ticks = 0\n'
+        'fun reset() { ticks = 0 }\nfun onSwipe() { reset() }\n}\n'
+    )
     decision = {
         'decision': 'fix',
-        'analysis': 'Observed: repeated calls allocate a temporary list.',
-        'reason': 'Confirmed by code inspection.',
+        'analysis': 'The crash is fixed, but swipe reset behavior must remain unchanged.',
+        'reason': 'The crash path is corrected.',
         'sourcePath': SOURCE_PATH,
         'sourceLine': 2,
         'files': [
-            {'path': SOURCE_PATH, 'content': 'package org.koin\nclass Thing { fun value() = 2 }\n'},
+            {'path': SOURCE_PATH, 'content': (
+                'package org.koin\nclass FixedTicker { var ticks = 0\n'
+                'fun reset() { ticks = 0 }\nfun onSwipe() { /* no reset */ }\n}\n'
+            )},
             {'path': test_path, 'content': (
-                'package org.koin\nimport org.junit.Test\nimport org.junit.Assert.assertTrue\n'
+                'package org.koin\nimport org.junit.Test\nimport org.junit.Assert.assertEquals\n'
                 + f'class {regression_test_name(identity)[:-3]} {{\n'
-                + '    @Test fun valueIsPositive() { assertTrue(Thing().value() > 0) }\n}\n'
+                + '    @Test fun crashIsPrevented() { assertEquals(0, FixedTicker().ticks) }\n}\n'
+            )},
+            {'path': preservation_path, 'content': (
+                'package org.koin\nimport org.junit.Test\nimport org.junit.Assert.assertEquals\n'
+                + f'class CrashlyticsPreservation{identity[:12]}Test {{\n'
+                + '    @Test fun swipeResetsTicker() { val ticker = FixedTicker(); ticker.ticks = 3; '
+                + 'ticker.onSwipe(); assertEquals(0, ticker.ticks) }\n}\n'
             )},
         ],
     }
+    from crashlytics_automation.behavior import source_digest
+    changed_source = decision['files'][0]['content']
+    review_files = [{
+        'path': SOURCE_PATH, 'kind': 'source',
+        'beforeSha256': hashlib.sha256(source_before.encode()).hexdigest(),
+        'afterSha256': hashlib.sha256(changed_source.encode()).hexdigest(),
+    }]
+    decision['behaviorReview'] = {
+        'version': 1, 'approved': True, 'reason': 'Swipe reset is protected by a preservation test.',
+        'unrelatedChanges': [],
+        'contracts': [{
+            'sourcePath': SOURCE_PATH, 'sourceLine': 2,
+            'behavior': 'Swiping resets the ticker.',
+            'testPath': preservation_path, 'testMethod': 'swipeResetsTicker',
+        }],
+        'sourceDigest': source_digest(review_files),
+    }
+
+
 
     class CheckedOutGithub(Github):
         def checkout(self, sha, destination):
@@ -234,10 +269,31 @@ def test_failed_trusted_verification_reports_analysis_without_publishing(monkeyp
         def execute(self, **_kwargs):
             raise AssertionError('provider output is already stubbed')
 
-        def verify_candidate(self, **_kwargs):
+        def verify_candidate(self, *, files, behavior_review, **_kwargs):
+            from crashlytics_automation.behavior import candidate_digest
             verify_calls.append(True)
             assert target in queue.proposals
-            return {'passed': False, 'reason': 'Regression test passed before the fix.'}
+            assert behavior_review == decision['behaviorReview']
+            return {
+                'version': 2, 'passed': False, 'retryable': False,
+                'reason': 'Candidate preservation failed: swipe reset behavior changed.',
+                'behaviorReview': behavior_review,
+                'candidateDigest': candidate_digest(files),
+                'checks': [
+                    {'phase': 'baseline', 'purpose': 'crash', 'path': test_path, 'exit_code': 1,
+                     'timed_out': False, 'test_result': 'failed',
+                     'evidence': {'source': 'junit-xml'}, 'methods': []},
+                    {'phase': 'candidate', 'purpose': 'crash', 'path': test_path, 'exit_code': 0,
+                     'timed_out': False, 'test_result': 'passed',
+                     'evidence': {'source': 'junit-xml'}, 'methods': ['crashIsPrevented']},
+                    {'phase': 'baseline', 'purpose': 'preservation', 'path': preservation_path,
+                     'exit_code': 0, 'timed_out': False, 'test_result': 'passed',
+                     'evidence': {'source': 'junit-xml'}, 'methods': ['swipeResetsTicker']},
+                    {'phase': 'candidate', 'purpose': 'preservation', 'path': preservation_path,
+                     'exit_code': 1, 'timed_out': False, 'test_result': 'failed',
+                     'evidence': {'source': 'junit-xml'}, 'methods': []},
+                ],
+            }
     queue = Queue()
     _patch_queue(monkeypatch, queue)
     reports = []
@@ -265,47 +321,19 @@ def test_failed_trusted_verification_reports_analysis_without_publishing(monkeyp
         job['branchBases'] = {'production': BASE_SHA}
     result = worker.run_job(CheckedOutGithub(), {'botLogin': 'autofix[bot]'}, job)
 
-    assert result == {'outcome': 'manual'}
-    assert queue.latest['status'] == 'manual'
-    assert queue.latest['analyses'][target]['analysis'] == decision['analysis']
-    assert queue.latest['analyses'][target]['verification'] == {
-        'passed': False, 'reason': 'Regression test passed before the fix.', 'retryable': False,
+    assert result == {
+        'outcome': 'queued', 'issueNumber': 17, 'baseBranch': target, 'behaviorRepair': True,
     }
-    assert reports and reports[0][1] == 'Regression test passed before the fix.'
-    assert reports[0][0].evidence['investigation']['analyses'][target]['analysis'] == decision['analysis']
+    assert queue.latest['status'] == 'queued'
+    assert queue.latest['analyses'][target]['analysis'] == decision['analysis']
+    assert queue.latest['analyses'][target]['verification']['passed'] is False
+    assert 'Candidate preservation failed' in queue.latest['analyses'][target]['verification']['reason']
+    assert reports == []
     assert publications == []
-    assert target in queue.latest['proposals']
-
-    resumed = copy.deepcopy(queue.latest)
-    resumed['status'] = 'queued'
-    resumed.pop('reportPending', None)
-    resumed.pop('reason', None)
-    resumed['attempts'][target] = 4
-    resumed['attemptLimits'][target] = 4
-    queue.put(resumed)
-    monkeypatch.delenv('CRASHLYTICS_OPENAI_API_KEY', raising=False)
-    monkeypatch.setattr(
-        'crashlytics_automation.openai_client.request_fix_proposal',
-        lambda **_kwargs: (_ for _ in ()).throw(AssertionError('resume must not call the model')),
-    )
-    worker.run_job(CheckedOutGithub(), {'botLogin': 'autofix[bot]'}, copy.deepcopy(queue.latest))
-    assert queue.latest['attempts'][target] == 4
-    assert queue.latest['verificationAttempts'][target] == 2
-
-    stale = copy.deepcopy(queue.latest)
-    stale['branchBases'][target] = '8' * 40
-    queue.put(stale)
-    worker.run_job(CheckedOutGithub(), {'botLogin': 'autofix[bot]'}, copy.deepcopy(queue.latest))
-    assert queue.latest['attempts'][target] == 4
-    assert queue.latest['verificationAttempts'][target] == 2
-
-    capped = copy.deepcopy(queue.latest)
-    capped['branchBases'][target] = BASE_SHA
-    capped['verificationAttempts'][target] = 3
-    queue.put(capped)
-    worker.run_job(CheckedOutGithub(), {'botLogin': 'autofix[bot]'}, copy.deepcopy(queue.latest))
-    assert queue.latest['verificationAttempts'][target] == 3
-    assert len(verify_calls) == 2
+    assert target not in queue.latest.get('proposals', {})
+    assert queue.latest['preservation']['contracts'] == decision['behaviorReview']['contracts']
+    assert queue.latest['preservation']['files'][0]['path'] == preservation_path
+    assert len(verify_calls) == 1
 
 
 
@@ -335,6 +363,42 @@ def test_held_manual_job_with_both_publications_never_delivers(monkeypatch):
     assert result == {'outcome': 'manual', 'issueNumber': 17}
     assert queue.latest == job
 
+def test_published_pre_policy_job_is_held_without_any_delivery_or_write(monkeypatch):
+    from crashlytics_automation import issues
+
+    queue = Queue()
+    _patch_queue(monkeypatch, queue)
+    job = _base_job()
+    job.pop('verificationPolicy', None)
+    job['branches'] = {'production': _fix('production', 1789).to_payload()}
+    job['sources'] = {'production': _source()}
+    job['branchBases'] = {'production': BASE_SHA}
+    queue.latest = copy.deepcopy(job)
+    writes = []
+    forbidden = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError('pre-policy published job must remain write-free')
+    )
+    monkeypatch.setattr(queue, 'put', forbidden)
+    monkeypatch.setattr(issues, 'verify_crash_issue', forbidden)
+    monkeypatch.setattr(issues, 'record_fix_progress', forbidden)
+    monkeypatch.setattr(issues, 'report_for_human', forbidden)
+    monkeypatch.setattr('crashlytics_automation.openai_client.request_fix_proposal', forbidden)
+    monkeypatch.setattr('crashlytics_automation.fix_generation.publish_investigated_fix', forbidden)
+    monkeypatch.setattr('crashlytics_automation.fix_generation.existing_fix', forbidden)
+    monkeypatch.setattr(worker, 'enqueue_task', lambda *_args, **_kwargs: writes.append('enqueue'))
+
+    class NoGithubWrites:
+        def rest(self, method, path, *_args, **_kwargs):
+            writes.append((method, path))
+            raise AssertionError('pre-policy job must not read or mutate GitHub')
+
+    result = worker.run_job(NoGithubWrites(), {'botLogin': 'autofix[bot]'}, copy.deepcopy(job))
+
+    assert result == {'outcome': 'held-existing', 'issueNumber': 17}
+    assert queue.latest == job
+    assert writes == []
+
+
 
 @pytest.mark.parametrize('interruption', ['none', 'verification', 'publication'])
 def test_one_verified_fix_publishes_both_targets_and_recovers_without_reinvestigation(monkeypatch, interruption):
@@ -342,30 +406,75 @@ def test_one_verified_fix_publishes_both_targets_and_recovers_without_reinvestig
 
     identity = identity_hash_for(ALERT.issue_id, RELEASE_SHA)
     test_path = f'domain/src/test/kotlin/org/koin/{regression_test_name(identity)}'
+    preservation_path = (
+        f'domain/src/test/kotlin/org/koin/CrashlyticsPreservation{identity[:12]}Test.kt'
+    )
+    preservation_content = (
+        'package org.koin\nimport org.junit.Test\nimport org.junit.Assert.assertEquals\n'
+        + f'class CrashlyticsPreservation{identity[:12]}Test {{\n'
+        + '    @Test fun originalValueRemainsStable() { assertEquals(1, Thing().originalValue()) }\n}\n'
+    )
+    candidate_source = 'package org.koin\nclass Thing { fun value() = 2; fun originalValue() = 1 }\n'
+    source_before = 'package org.koin\nclass Thing { fun value() = 1; fun originalValue() = 1 }\n'
+    regression_content = (
+        'package org.koin\nimport org.junit.Test\nimport org.junit.Assert.assertEquals\n'
+        + f'class {regression_test_name(identity)[:-3]} {{\n'
+        + '    @Test fun valueMatchesExpected() { assertEquals(2, Thing().value()) }\n}\n'
+    )
     decision = {
         'decision': 'fix', 'analysis': 'Observed before/after regression.', 'reason': 'Verified correction.',
         'sourcePath': SOURCE_PATH, 'sourceLine': 2,
         'files': [
-            {'path': SOURCE_PATH, 'content': 'package org.koin\nclass Thing { fun value() = 2 }\n'},
-            {'path': test_path, 'content': (
-                'package org.koin\nimport org.junit.Test\nimport org.junit.Assert.assertEquals\n'
-                + f'class {regression_test_name(identity)[:-3]} {{\n'
-                + '    @Test fun valueMatchesExpected() { assertEquals(2, Thing().value()) }\n}\n'
-            )},
+            {'path': SOURCE_PATH, 'content': candidate_source},
+            {'path': test_path, 'content': regression_content},
+            {'path': preservation_path, 'content': preservation_content},
         ],
     }
+    from crashlytics_automation.behavior import candidate_digest, source_digest
+    proof_files = [
+        {'path': SOURCE_PATH, 'kind': 'source',
+         'beforeSha256': hashlib.sha256(source_before.encode()).hexdigest(),
+         'afterSha256': hashlib.sha256(candidate_source.encode()).hexdigest()},
+        {'path': test_path, 'kind': 'test', 'beforeSha256': None,
+         'afterSha256': hashlib.sha256(regression_content.encode()).hexdigest()},
+        {'path': preservation_path, 'kind': 'test', 'beforeSha256': None,
+         'afterSha256': hashlib.sha256(preservation_content.encode()).hexdigest()},
+    ]
+    review = {
+        'version': 1, 'approved': True, 'reason': 'Original behavior remains intact.',
+        'unrelatedChanges': [],
+        'contracts': [{
+            'sourcePath': SOURCE_PATH, 'sourceLine': 2,
+            'behavior': 'originalValue remains stable.',
+            'testPath': preservation_path, 'testMethod': 'originalValueRemainsStable',
+        }],
+        'sourceDigest': source_digest(proof_files),
+    }
+    decision['behaviorReview'] = review
     successful_verification = {
-        'passed': True, 'reason': 'all regressions reproduced and passed with candidate',
+        'version': 2, 'passed': True, 'reason': 'Crash fixed and original behavior preserved.',
+        'behaviorReview': review, 'candidateDigest': candidate_digest(proof_files),
         'checks': [
-            {'phase': 'baseline', 'path': test_path, 'exit_code': 1, 'timed_out': False,
-             'test_result': 'failed', 'evidence': {'source': 'junit-xml'}},
-            {'phase': 'candidate', 'path': test_path, 'exit_code': 0, 'timed_out': False,
-             'test_result': 'passed', 'evidence': {'source': 'junit-xml'}},
+            {'phase': 'baseline', 'purpose': 'crash', 'path': test_path, 'exit_code': 1,
+             'timed_out': False, 'test_result': 'failed', 'evidence': {'source': 'junit-xml'},
+             'methods': []},
+            {'phase': 'candidate', 'purpose': 'crash', 'path': test_path, 'exit_code': 0,
+             'timed_out': False, 'test_result': 'passed', 'evidence': {'source': 'junit-xml'},
+             'methods': ['valueMatchesExpected']},
+            *[
+                {'phase': phase, 'purpose': 'preservation', 'path': preservation_path, 'exit_code': 0,
+                 'timed_out': False, 'test_result': 'passed', 'evidence': {'source': 'junit-xml'},
+                 'methods': ['originalValueRemainsStable']}
+                for phase in ('baseline', 'candidate')
+            ],
         ],
     }
     verification_results = [successful_verification]
     if interruption == 'verification':
-        verification_results.insert(0, {'passed': False, 'retryable': True, 'reason': 'verification command timed out'})
+        verification_results.insert(0, {
+            'version': 2, 'passed': False, 'retryable': True,
+            'reason': 'verification command timed out',
+        })
     seen_candidates, sandbox_starts = [], []
 
     class CheckedOutGithub(Github):
@@ -374,7 +483,7 @@ def test_one_verified_fix_publishes_both_targets_and_recovers_without_reinvestig
             if sha == BASE_SHA:
                 source = destination / SOURCE_PATH
                 source.parent.mkdir(parents=True, exist_ok=True)
-                source.write_text('package org.koin\nclass Thing { fun value() = 1 }\n', encoding='utf-8')
+                source.write_text(source_before, encoding='utf-8')
 
     class RetrySandbox:
         def __init__(self, **kwargs):
@@ -741,14 +850,14 @@ def test_completed_proposal_recovery_survives_conflict_without_exposing_private_
     from crashlytics_automation import issues
     from crashlytics_automation.investigation_jobs import JobConflict
 
-    source_before = 'package org.koin\nclass Thing { fun value() = 1 }\n'
+    source_before = 'package org.koin\nclass Thing { fun value() = 1; fun originalValue() = 7 }\n'
     identity = identity_hash_for(ALERT.issue_id, RELEASE_SHA)
     test_path = f'domain/src/test/kotlin/org/koin/{regression_test_name(identity)}'
     decision = {
         'decision': 'fix', 'analysis': 'An actual completed analysis.', 'reason': 'A proposed repair.',
         'sourcePath': SOURCE_PATH, 'sourceLine': 2,
         'files': [
-            {'path': SOURCE_PATH, 'content': 'package org.koin\nclass Thing { fun value() = 2 }\n'},
+            {'path': SOURCE_PATH, 'content': 'package org.koin\nclass Thing { fun value() = 2; fun originalValue() = 7 }\n'},
             {'path': test_path, 'content': (
                 'package org.koin\nimport org.junit.Test\nimport org.junit.Assert.assertEquals\n'
                 + f'class {regression_test_name(identity)[:-3]} {{\n'
@@ -756,6 +865,28 @@ def test_completed_proposal_recovery_survives_conflict_without_exposing_private_
             )},
         ],
     }
+    from crashlytics_automation.behavior import preservation_test_name, prepare_behavior_review
+    from crashlytics_automation.candidate import validate_candidate
+    preservation_path = f'domain/src/test/kotlin/org/koin/{preservation_test_name(identity)}'
+    preservation_file = {
+        'path': preservation_path,
+        'content': (
+            f'package org.koin\nclass {preservation_test_name(identity)[:-3]} {{\n'
+            '  @org.junit.Test fun originalValueIsPreserved() {\n'
+            '    org.junit.Assert.assertEquals(7, Thing().originalValue())\n  }\n}\n'
+        ),
+    }
+    decision['files'].append(preservation_file)
+    normalized = validate_candidate(decision['files'], {SOURCE_PATH: source_before}, identity)
+    assert normalized['valid']
+    decision['behaviorReview'] = prepare_behavior_review({
+        'approved': True, 'reason': 'Only the defective return value changes.',
+        'unrelatedChanges': [], 'files': [preservation_file],
+        'contracts': [{
+            'sourcePath': SOURCE_PATH, 'sourceLine': 2, 'behavior': 'originalValue remains seven.',
+            'testPath': preservation_path, 'testMethod': 'originalValueIsPreserved',
+        }],
+    }, normalized['files'], {SOURCE_PATH: source_before}, identity)
 
     class CheckedOutGithub(Github):
         def rest(self, method, path, *args, **kwargs):

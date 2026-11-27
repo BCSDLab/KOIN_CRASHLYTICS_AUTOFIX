@@ -18,9 +18,50 @@ ISSUE = 17
 ALERT = CrashAlert('crash-1', '1.2.3', 'event-1', '2026-01-01T00:00:00Z', 'Crash', 'detail')
 SOURCE = 'domain/src/main/java/org/koin/Thing.java'
 TEST = 'domain/src/test/java/org/koin/CrashlyticsRegressionPLACEHOLDERTest.kt'
-BEFORE = b'package org.koin;\nclass Thing { fun value() = 1 }\n'
-AFTER = b'package org.koin;\nclass Thing { fun value() = 2 }\n'
-TEST_BYTES = b'package org.koin\nclass RegressionTest\n'
+BEFORE = b'package org.koin;\nclass Thing { int value() { return 1; } }\n'
+AFTER = b'package org.koin;\nclass Thing { int value() { return 2; } }\n'
+PRESERVATION = 'domain/src/test/java/org/koin/CrashlyticsPreservationPLACEHOLDERTest.kt'
+
+
+def _verification(test_path, preservation_path, source_after_sha, test_sha, preservation_sha):
+    from crashlytics_automation.behavior import candidate_digest, source_digest
+
+    source_files = [{
+        'path': SOURCE, 'kind': 'source', 'beforeSha256': sha256(BEFORE),
+        'afterSha256': source_after_sha,
+    }]
+    review = {
+        'version': 1, 'approved': True, 'reason': 'Preserves established behavior.',
+        'unrelatedChanges': [],
+        'contracts': [{
+            'sourcePath': SOURCE, 'sourceLine': 2, 'behavior': 'Existing value remains stable.',
+            'testPath': preservation_path, 'testMethod': 'existingValueRemainsStable',
+        }],
+        'sourceDigest': source_digest(source_files),
+    }
+
+    def check(phase, purpose, path, result, exit_code, methods):
+        return {
+            'phase': phase, 'purpose': purpose, 'path': path, 'exit_code': exit_code,
+            'timed_out': False, 'test_result': result,
+            'evidence': {'source': 'junit-xml'}, 'methods': methods,
+        }
+
+    proof_files = [
+        *source_files,
+        {'path': test_path, 'kind': 'test', 'beforeSha256': None, 'afterSha256': test_sha},
+        {'path': preservation_path, 'kind': 'test', 'beforeSha256': None, 'afterSha256': preservation_sha},
+    ]
+    return {
+        'version': 2, 'passed': True, 'reason': 'Crash fixed and behavior preserved.',
+        'candidateDigest': candidate_digest(proof_files), 'behaviorReview': review,
+        'checks': [
+            check('baseline', 'crash', test_path, 'failed', 1, []),
+            check('candidate', 'crash', test_path, 'passed', 0, ['regressionReproduced']),
+            check('baseline', 'preservation', preservation_path, 'passed', 0, ['existingValueRemainsStable']),
+            check('candidate', 'preservation', preservation_path, 'passed', 0, ['existingValueRemainsStable']),
+        ],
+    }
 
 
 class Store:
@@ -155,16 +196,34 @@ class NotFound(Exception):
 def setup(monkeypatch, *, extra=False):
     identity = identity_hash_for(ALERT.issue_id, RELEASE)
     test_path = TEST.replace('PLACEHOLDER', identity[:12])
+    preservation_path = PRESERVATION.replace('PLACEHOLDER', identity[:12])
+    test_class = test_path.rsplit('/', 1)[1].removesuffix('.kt')
+    preservation_class = preservation_path.rsplit('/', 1)[1].removesuffix('.kt')
+    test_bytes = (
+        f'package org.koin\nclass {test_class} {{\n'
+        '  @org.junit.Test fun regressionReproduced() {}\n}\n'
+    ).encode()
+    preservation_bytes = (
+        f'package org.koin\nclass {preservation_class} {{\n'
+        '  @org.junit.Test fun existingValueRemainsStable() {}\n}\n'
+    ).encode()
+    files = [
+        {'path': SOURCE, 'kind': 'source', 'beforeSha256': sha256(BEFORE), 'afterSha256': sha256(AFTER)},
+        {'path': test_path, 'kind': 'test', 'beforeSha256': None, 'afterSha256': sha256(test_bytes)},
+        {'path': preservation_path, 'kind': 'test', 'beforeSha256': None,
+         'afterSha256': sha256(preservation_bytes)},
+    ]
     manifest = candidate_manifest(
         issue_id=ALERT.issue_id, issue_number=ISSUE, identity_hash=identity,
         base_sha=BASE, branch_base_sha=BRANCH_BASE, source_sha=RELEASE,
-        source_path=SOURCE, files=[
-            {'path': SOURCE, 'kind': 'source', 'beforeSha256': sha256(BEFORE), 'afterSha256': sha256(AFTER)},
-            {'path': test_path, 'kind': 'test', 'beforeSha256': None, 'afterSha256': sha256(TEST_BYTES)},
-        ],
+        source_path=SOURCE, files=files,
+        verification=_verification(
+            test_path, preservation_path, sha256(AFTER),
+            sha256(test_bytes), sha256(preservation_bytes),
+        ),
     )
     Store.record = manifest
-    files = {SOURCE: AFTER, test_path: TEST_BYTES}
+    files = {SOURCE: AFTER, test_path: test_bytes, preservation_path: preservation_bytes}
     if extra:
         files['automation/extra.json'] = b'{}'
     github = Github(files)
@@ -241,10 +300,24 @@ def test_moved_head_blocks_before_publication_lookup(monkeypatch):
     assert result['outcome'] == 'blocked'
     assert github.merged_sha is None
 
+def test_legacy_cached_manifest_cannot_authorize_merge(monkeypatch):
+    github, job, manifest = setup(monkeypatch)
+    legacy = {key: value for key, value in manifest.items() if key != 'verification'}
+    legacy['version'] = 3
+    Store.record = legacy
+    job['manifestDigest'] = manifest_digest(legacy)
+
+    result = attempt_merge(github, job, bot_login='autofix[bot]')
+
+    assert result['outcome'] == 'blocked'
+    assert github.merged_sha is None
+
+
 
 def _registered_investigation(job, status='merging'):
     return {
         'status': status,
+        'verificationPolicy': 2,
         'branches': {
             branch: {
                 'pullNumber': pull['number'],

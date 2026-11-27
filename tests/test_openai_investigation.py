@@ -10,8 +10,122 @@ from crashlytics_automation import openai_client
 from crashlytics_automation.openai_client import (
     FixProposalResponseError,
     _run_experiment,
-    request_fix_proposal,
+    request_fix_proposal as _request_fix_proposal,
 )
+
+
+def request_fix_proposal(**kwargs):
+    kwargs.setdefault('read_baseline', lambda paths: {path: 'original source\n' for path in paths})
+    kwargs.setdefault('review_execute', lambda **_arguments: {
+        'exit_code': 0, 'stdout': '', 'stderr': '', 'timed_out': False,
+    })
+    return _request_fix_proposal(**kwargs)
+@pytest.mark.parametrize('reject_once,tool_budget', [(False, None), (True, None), (False, 1)])
+def test_fix_requires_independent_review_of_original_and_proposed_sources(monkeypatch, reject_once, tool_budget):
+    from crashlytics_automation.behavior import preservation_test_name
+    from crashlytics_automation.candidate import identity_hash_for, regression_test_name
+
+    identity = identity_hash_for('issue-1', 'a' * 40)
+    source_path = 'domain/src/main/kotlin/org/koin/Thing.kt'
+    crash_path = f'domain/src/test/kotlin/org/koin/{regression_test_name(identity)}'
+    preservation_path = f'domain/src/test/kotlin/org/koin/{preservation_test_name(identity)}'
+    original = 'package org.koin\nclass Thing { fun value() = 1; fun delayAfterSwipe() = 3000 }\n'
+    changed = 'package org.koin\nclass Thing { fun value() = 2; fun delayAfterSwipe() = 3000 }\n'
+    changed_ticker = 'package org.koin\nclass Thing { fun value() = 2; fun delayAfterSwipe() = 0 }\n'
+    crash_test = (
+        f'package org.koin\nclass {regression_test_name(identity)[:-3]} {{\n'
+        '  @org.junit.Test fun valueReturnsExpected() { org.junit.Assert.assertEquals(2, Thing().value()) }\n}\n'
+    )
+    preservation_test = (
+        f'package org.koin\nclass {preservation_test_name(identity)[:-3]} {{\n'
+        '  @org.junit.Test fun originalValueRemainsStable() { org.junit.Assert.assertEquals(3000, Thing().delayAfterSwipe()) }\n}\n'
+    )
+    proposal = {
+        'decision': 'fix', 'reason': 'The return value is wrong.', 'analysis': 'Observed the wrong value.',
+        'sourcePath': source_path, 'sourceLine': 2,
+        'files': [
+            {'path': source_path, 'content': changed},
+            {'path': crash_path, 'content': crash_test},
+        ],
+    }
+    review = {
+        'approved': True, 'reason': 'The only change addresses the defect.',
+        'unrelatedChanges': [],
+        'contracts': [{
+            'sourcePath': source_path, 'sourceLine': 2,
+            'behavior': '수동 스와이프 후 기존 대기 시간 3초를 보존한다.',
+            'testPath': preservation_path, 'testMethod': 'originalValueRemainsStable',
+        }],
+        'files': [{'path': preservation_path, 'content': preservation_test}],
+    }
+
+    def response(value):
+        text = json.dumps(value)
+        return {'status': 'completed', 'output_text': text, 'output': [
+            {'type': 'message', 'role': 'assistant',
+             'content': [{'type': 'output_text', 'text': text}]},
+        ]}
+
+    first_proposal = proposal
+    if reject_once:
+        first_proposal = {
+            **proposal,
+            'files': [{'path': source_path, 'content': changed_ticker}, proposal['files'][1]],
+        }
+    responses = [
+        tool_call('{"command":"cat domain/src/main/kotlin/org/koin/Thing.kt","timeout_seconds":30}'),
+        response(first_proposal),
+        tool_call('{"command":"cat /workspace/target/domain/src/main/kotlin/org/koin/Thing.kt","timeout_seconds":30}',
+                  call_id='review_call', item_id='review_tool', reasoning_id='review_reasoning'),
+    ]
+    if reject_once:
+        responses.extend([
+            response({'approved': False, 'reason': '스와이프 뒤 대기 시간이 사라졌습니다.',
+                      'unrelatedChanges': ['기존 타이머 재시작 계약 변경'], 'contracts': [], 'files': []}),
+            response(proposal),
+        ])
+    responses.append(response(review))
+    session = FakeSession(*responses)
+    if tool_budget is not None:
+        monkeypatch.setattr(openai_client, 'MAX_TOOL_CALLS', tool_budget)
+    baseline_reads, review_commands = [], []
+
+    def read_baseline(paths):
+        baseline_reads.append(paths)
+        return {source_path: original}
+
+    def review_execute(*, command, timeout_seconds):
+        review_commands.append((command, timeout_seconds))
+        return {'exit_code': 0, 'stdout': 'reviewed original and patch', 'stderr': '', 'timed_out': False}
+
+    arguments = {
+        'api_key': 'secret-key',
+        'context': {'identityHash': identity, 'paths': {'target': '/target'}},
+        'execute': lambda **_kwargs: {'exit_code': 0, 'stdout': 'clean', 'stderr': '', 'timed_out': False},
+        'read_baseline': read_baseline, 'review_execute': review_execute, 'session': session,
+    }
+    if tool_budget is not None:
+        with pytest.raises(FixProposalResponseError) as error:
+            request_fix_proposal(**arguments)
+        assert error.value.code == 'investigation_call_limit'
+        assert review_commands == []
+        return
+    result = request_fix_proposal(**arguments)
+
+    assert all(paths == [source_path, crash_path] for paths in baseline_reads)
+    assert len(review_commands) == 1
+    reviewer_input = session.payloads[2]['input'][1]['content']
+    reviewer_context = json.loads(reviewer_input)
+    assert reviewer_context['originalSources'][source_path] == original
+    assert {file['path']: file['content'] for file in reviewer_context['proposedFiles']}[source_path] == (
+        changed_ticker if reject_once else changed
+    )
+    assert proposal['analysis'] not in reviewer_input
+    assert result['behaviorReview']['approved'] is True
+    assert {item['path'] for item in result['files']} == {
+        source_path, crash_path, preservation_path,
+    }
+    assert next(file['content'] for file in result['files'] if file['path'] == source_path) == changed
 
 
 class FakeResponse:
@@ -414,14 +528,33 @@ def test_provider_timeout_and_token_limit_are_reported_without_secret_echo():
 
 def test_large_byte_input_uses_exact_count_and_can_complete_investigation(monkeypatch):
     monkeypatch.setattr(openai_client, 'MAX_CUMULATIVE_INPUT_TOKENS', 1000)
+    from crashlytics_automation.behavior import preservation_test_name
+    from crashlytics_automation.candidate import identity_hash_for, regression_test_name
+    identity = identity_hash_for('large-input', 'a' * 40)
+    source_path = 'domain/src/main/kotlin/org/koin/Main.kt'
+    regression_path = f'domain/src/test/kotlin/org/koin/{regression_test_name(identity)}'
+    preservation_path = f'domain/src/test/kotlin/org/koin/{preservation_test_name(identity)}'
     proposal = {
-        'decision': 'fix',
-        'reason': 'A defect was identified.',
-        'analysis': 'Observed a reproducible defect.',
-        'sourcePath': 'src/Main.kt',
-        'sourceLine': 12,
-        'files': [{'path': 'src/Main.kt', 'content': 'class Main'}],
+        'decision': 'fix', 'reason': 'A defect was identified.',
+        'analysis': 'Observed a reproducible defect.', 'sourcePath': source_path, 'sourceLine': 2,
+        'files': [
+            {'path': source_path, 'content': 'package org.koin\nclass Main { fun value() = 2 }\n'},
+            {'path': regression_path, 'content': f'package org.koin\nclass {regression_test_name(identity)[:-3]} {{ @org.junit.Test fun reproduces() {{}} }}\n'},
+        ],
     }
+    review = {
+        'approved': True, 'reason': 'No unrelated changes.',
+        'unrelatedChanges': [],
+        'contracts': [{
+            'sourcePath': source_path, 'sourceLine': 2, 'behavior': 'Original value remains stable.',
+            'testPath': preservation_path, 'testMethod': 'originalValueRemainsStable',
+        }],
+        'files': [{
+            'path': preservation_path,
+            'content': f'package org.koin\nclass {preservation_test_name(identity)[:-3]} {{ @org.junit.Test fun originalValueRemainsStable() {{}} }}\n',
+        }],
+    }
+
 
     class Session:
         def __init__(self):
@@ -436,9 +569,10 @@ def test_large_byte_input_uses_exact_count_and_can_complete_investigation(monkey
             if self.generation_calls == 1:
                 body = tool_call()
             else:
+                result = proposal if self.generation_calls == 2 else review
                 body = {
                     'status': 'completed',
-                    'output_text': json.dumps(proposal),
+                    'output_text': json.dumps(result),
                     'usage': {'input_tokens': 10, 'output_tokens': 10},
                     'output': [],
                 }
@@ -449,13 +583,17 @@ def test_large_byte_input_uses_exact_count_and_can_complete_investigation(monkey
     session = Session()
     result = request_fix_proposal(
         api_key='secret-key',
-        context={'evidence': 'large ' * 1000},
+        context={'evidence': 'large ' * 1000, 'identityHash': identity},
         execute=lambda **_: {'exit_code': 0, 'stdout': 'ok', 'stderr': '', 'timed_out': False},
+        read_baseline=lambda _paths: {
+            source_path: 'package org.koin\nclass Main { fun value() = 1 }\n',
+        },
+        review_execute=lambda **_: {'exit_code': 0, 'stdout': '', 'stderr': '', 'timed_out': False},
         session=session,
     )
     assert result['decision'] == 'fix'
     assert session.count_calls >= 1
-    assert session.generation_calls == 2
+    assert session.generation_calls == 3
 
 
 @pytest.mark.parametrize('count_result,expected_code', [
